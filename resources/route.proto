@@ -1,0 +1,14 @@
+syntax="proto3";
+package loop;
+
+service RouteService{
+    rpc Hello(Request) returns (Response);
+}
+
+message Request {
+    string rid = 1;
+}
+
+message Response {
+    string rspid = 2;
+}

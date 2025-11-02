@@ -1,0 +1,54 @@
+#include <grpc/grpc.h>
+#include <grpcpp/channel.h>
+#include <grpcpp/client_context.h>
+#include <grpcpp/create_channel.h>
+#include <grpcpp/security/credentials.h>
+
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <random>
+#include <string>
+#include <thread>
+
+#include "route.grpc.pb.h"
+
+
+using grpc::Channel;
+using grpc::ClientContext;
+using grpc::ClientReader;
+using grpc::ClientReaderWriter;
+using grpc::ClientWriter;
+using grpc::Status;
+
+using loop::RouteService;
+using namespace std;
+
+class NodeClient{
+    private:
+        unique_ptr<RouteService::Stub> stub_;
+    public:
+        explicit NodeClient(std::shared_ptr<grpc::Channel> channel): stub_(RouteService::NewStub(channel)){}
+
+        string getHello(const string& rid){
+            loop::Request request;
+            request.set_rid(rid);
+
+            loop::Response response;
+
+            grpc::ClientContext context;
+
+            grpc::Status status = stub_->Hello(&context, request, &response);
+
+            if(status.ok()){
+                return response.rspid();
+            }else{
+                cerr << "RPC failed: " << status.error_code() << " - " << status.error_message() << endl;
+                return "RPC_ERR";
+            }
+
+
+        }
+
+
+};
