@@ -46,7 +46,21 @@ class NodeClient{
                 cerr << "RPC failed: " << status.error_code() << " - " << status.error_message() << endl;
                 return "RPC_ERR";
             }
+        }
 
+        string getLeader(){
+            loop::Request request;
+            loop::Response response;
+            grpc::ClientContext context;
+            
+            grpc::Status status = stub_->DetermineLeader(&context, request, &response);
+
+            if(status.ok()){
+                return "end";
+            }else{
+                cerr << "RPC failed " << status.error_code() << " - " << status.error_message() << endl;
+                return "RPC_ERR";
+            }
 
         }
 

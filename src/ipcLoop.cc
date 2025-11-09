@@ -30,3 +30,20 @@ grpc::Status ipcLoop::Hello(grpc::ServerContext* context, const loop::Request* r
 
         return Status::OK;
 }
+
+grpc::Status ipcLoop::DetermineLeader(grpc::ServerContext* context, const loop::Request* request, loop::Response* response){
+    #if defined(USE_OPENMP)
+    #pragma omp parallel 
+    {
+        int tId = omp_get_thread_num();
+
+        if(tId == 0){
+            printf("\nThread %d is the leader\n", tId);
+        }
+    }
+    #else
+    printf("Single Threaded. No leader.");
+    #endif
+    return Status::OK;
+    
+}

@@ -35,9 +35,12 @@ int main(int arg, char** argv){
     NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
 
     string rid = "Req-123";
+    string intro = client.getLeader();
     string response = client.getHello(rid);
 
     cout << response << endl;
+
+
 
     return 0;
 }
