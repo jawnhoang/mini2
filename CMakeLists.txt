@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.20)
 project(loop LANGUAGES C CXX)
 
 # ------------------------------------------------------------
@@ -38,17 +38,27 @@ find_package(OpenMP)
 # 2. gRPC / Protobuf setup (Homebrew-friendly)
 # ------------------------------------------------------------
 list(APPEND CMAKE_PREFIX_PATH
+  "/usr/local/opt/grpc"
+  "/usr/local/opt/protobuf"
   "/opt/homebrew/opt/grpc"
   "/opt/homebrew/opt/protobuf"
-  "/opt/homebrew/opt/llvm/lib/cmake"
 )
 
 # Find gRPC first — it brings its own protobuf dependency
 find_package(gRPC REQUIRED)
 
-# Try to find Protobuf only if not already found (avoids redefinition)
-if (NOT TARGET protobuf::libprotobuf)
-  find_package(Protobuf REQUIRED)
+find_package(Protobuf REQUIRED)
+
+# Abseil headers are required by newer protobuf (e.g., 33.x)
+find_path(ABSL_INCLUDE_DIR
+  NAMES absl/base/optimization.h
+  HINTS
+    /usr/local/opt/abseil/include
+    /opt/homebrew/opt/abseil/include
+    /opt/local/include
+)
+if(NOT ABSL_INCLUDE_DIR)
+  message(FATAL_ERROR "Could not find Abseil headers (absl). Install via Homebrew: brew install abseil")
 endif()
 # ------------------------------------------------------------
 # 3. Generate protobuf & gRPC sources
@@ -79,8 +89,12 @@ add_library(loop_lib
   ${PROTO_GENERATED_DIR}/route.pb.cc
   ${PROTO_GENERATED_DIR}/route.grpc.pb.cc
 )
-target_include_directories(loop_lib PUBLIC ${PROTO_GENERATED_DIR})
-target_link_libraries(loop_lib
+target_include_directories(loop_lib PUBLIC
+  ${PROTO_GENERATED_DIR}
+  ${Protobuf_INCLUDE_DIRS}
+  ${ABSL_INCLUDE_DIR}
+)
+target_link_libraries(loop_lib PUBLIC
   gRPC::grpc++
   protobuf::libprotobuf
 )
@@ -95,17 +109,39 @@ include_directories(include)
 
 add_executable(loop-server src/main_server.cc src/ipcLoop.cc)
 target_compile_definitions(loop-server PRIVATE USE_OPENMP)
-if (OpenMP_CXX_FOUND)
-  target_link_directories(loop-server PRIVATE OPENMP::OpenMP_CXX)
-else()
-  if (APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(STATUS "Using manual OpenMP flags for macOS Clang")
-    target_compile_options(loop-server PRIVATE -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include)
-    target_link_libraries(loop-server PRIVATE -L/opt/homebrew/opt/libomp/lib -lomp)
+
+# ---- OpenMP setup per platform ----
+if (APPLE)
+  # AppleClang does not ship OpenMP runtime; discover libomp from package managers.
+  find_path(LIBOMP_INCLUDE_DIR
+    NAMES omp.h
+    HINTS
+      /usr/local/opt/libomp/include
+      /opt/homebrew/opt/libomp/include
+      /opt/local/include
+  )
+  find_library(LIBOMP_LIBRARY
+    NAMES omp
+    HINTS
+      /usr/local/opt/libomp/lib
+      /opt/homebrew/opt/libomp/lib
+      /opt/local/lib
+  )
+  if (LIBOMP_INCLUDE_DIR AND LIBOMP_LIBRARY)
+    message(STATUS "OpenMP: using ${LIBOMP_LIBRARY}")
+    get_filename_component(LIBOMP_LIBDIR "${LIBOMP_LIBRARY}" DIRECTORY)
+    # Enable OpenMP front-end and wire in libomp
+    target_compile_options(loop-server PRIVATE -Xpreprocessor -fopenmp)
+    target_include_directories(loop-server PRIVATE "${LIBOMP_INCLUDE_DIR}")
+    target_link_libraries(loop-server PRIVATE "${LIBOMP_LIBRARY}")
+    target_link_options(loop-server PRIVATE "-L${LIBOMP_LIBDIR}" "-Wl,-rpath,${LIBOMP_LIBDIR}")
+  else()
+    message(FATAL_ERROR "libomp not found. Install with: brew install libomp (or MacPorts: sudo port install libomp)")
   endif()
+elseif (OpenMP_CXX_FOUND)
+  # Non-Apple platforms with a working OpenMP toolchain
+  target_link_libraries(loop-server PRIVATE OpenMP::OpenMP_CXX)
 endif()
-
-
 
 add_executable(loop-nt-server src/main_server.cc src/ipcLoop.cc)
 
@@ -120,41 +156,10 @@ target_include_directories(loop-nt-server PRIVATE ${PROTO_GENERATED_DIR})
 target_include_directories(loop-nt-client PRIVATE ${PROTO_GENERATED_DIR})
 target_include_directories(loop-client PRIVATE ${PROTO_GENERATED_DIR})
 
-# target_link_libraries(loop-server
-#   loop_lib
-#   gRPC::grpc++
-#   protobuf::libprotobuf
-# )
-
-# target_link_libraries(loop-nt-server
-#   loop_lib
-#   gRPC::grpc++
-#   protobuf::libprotobuf
-# )
-# ------------------------------------------------------------
-# 4. Link targets
-# ------------------------------------------------------------
-if(APPLE)
-  target_link_libraries(loop-server PRIVATE
-    ${Protobuf_LIBRARIES}
-    loop_lib
-  )
-  target_link_libraries(loop-nt-server PRIVATE
-    ${Protobuf_LIBRARIES}
-    loop_lib
-  )
-  target_link_libraries(loop-client
-  loop_lib
-  gRPC::grpc++
-  protobuf::libprotobuf
-)
-
-target_link_libraries(loop-nt-client
-  loop_lib
-  gRPC::grpc++
-  protobuf::libprotobuf
-)
-endif()
+target_link_libraries(loop-server PRIVATE loop_lib)
+target_link_libraries(loop-nt-server PRIVATE loop_lib)
+target_link_libraries(loop-client PRIVATE loop_lib)
+target_link_libraries(loop-nt-client PRIVATE loop_lib)
 
 # ------------------------------------------------------------
 # 5. macOS linker tweak
