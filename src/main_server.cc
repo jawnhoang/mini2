@@ -2,6 +2,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <iomanip>
 
 #include "omp.h"
 #include "NodeServer.hpp"

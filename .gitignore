@@ -1,0 +1,17 @@
+build/
+generated/
+*.o
+*.so
+*.pb.cc
+*.pb.h
+*.grpc.pb.cc
+*.log
+*.out
+*.dSYM/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+
+python/venv/
+__pycache__/
+.DS_Store
