@@ -39,6 +39,12 @@ int main(int arg, char** argv){
 
     cout << response << endl;
 
+    cout<<endl;
+
+    cout<< "Getting Average Population" << endl;
+    int tCnt = 2;
+    string response2 = client.getPopulation(tCnt);
+
 
 
     return 0;
