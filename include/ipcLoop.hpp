@@ -1,3 +1,4 @@
+#pragma once 
 
 #include <iostream>
 #include <memory>
@@ -31,6 +32,8 @@ class ipcLoop final : public RouteService::Service{
     //TODO
     Status Hello(::grpc::ServerContext* context, const ::loop::Request* request, ::loop::Response* response) override;
     
+    Status DetermineLeader(::grpc::ServerContext* context, const ::loop::Request* request, ::loop::Response* response) override;
+
 };
 
 

@@ -1,14 +1,31 @@
 syntax="proto3";
 package loop;
 
+//Calls ipcLoop::Hello
 service RouteService{
-    rpc Hello(Request) returns (Response);
+    rpc Hello(Request) returns (Response); // passes in Request and returns Response
+    rpc DetermineLeader(Request) returns (Response);
 }
 
+
+//Declares message objects that gets passed into service call
+//I think this can also be declared in main?
 message Request {
-    string rid = 1;
+    string rid = 1; // requestId
 }
 
 message Response {
-    string rspid = 2;
+    string rspid = 2; //responseId
+}
+
+
+
+service executeJob{
+    rpc getAvgPopulation(threadCnt) returns (Response); //Reads in a fire CSV and stores important datapoints as attributes in class objects
+
+}
+
+message threadCnt {
+    int32 tcnt = 4;
+
 }

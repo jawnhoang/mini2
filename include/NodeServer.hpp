@@ -4,6 +4,8 @@
 
 #include "omp.h"
 #include "ipcLoop.hpp"
+#include "jobs.hpp"
+#include "config.hpp"
 
 #include <grpc/grpc.h>
 #include <grpcpp/server.h>
@@ -23,33 +25,43 @@ using namespace std;
 
 class NodeServer{
     private:
-        string server_addr;
+        // string server_addr;
+        NodeId nodeInfo;
 
     public:
-        NodeServer(){}
+        explicit NodeServer(const NodeId& info):nodeInfo(info){}
 
-        string get_server_addr(){
-            return server_addr;
-        }
+        // string get_server_addr(){
+        //     return server_addr;
+        // }
 
-        void set_server_addr(const string& addr){
-            server_addr = addr;
-        }
+        // void set_server_addr(const string& addr){
+        //     server_addr = addr;
+        // }
 
         void runServer(){
             ipcLoop service;
+            jobLoop jobs;
 
             grpc::ServerBuilder builder;
-            builder.AddListeningPort(server_addr, grpc::InsecureServerCredentials());
+            builder.AddListeningPort(nodeInfo.addr, grpc::InsecureServerCredentials());
             builder.RegisterService(&service);
+            builder.RegisterService(&jobs);
             unique_ptr<grpc::Server> server(builder.BuildAndStart());
             #if defined(USE_OPENMP)
-            std::cout << "Server using openmp" << std::endl;
+            std::cout << "[Server] Using openmp" << std::endl;
             #else
-            std::cout << "Server is not threaded" << std::endl;
+            std::cout << "[Server] Running Single Threaded" << std::endl;
             #endif
 
-            cout << "Server listening on " << server_addr << endl;
+            cout << "[Node " << nodeInfo.id << "] listening on " << nodeInfo.addr << endl;
+            
+            cout << "[Node " << nodeInfo.id << "] Peers: ";
+            for(auto& p : nodeInfo.peer_id){
+                cout<< p << " ";
+            }
+            cout << endl;
+
             server->Wait();
         }
 

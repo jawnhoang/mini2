@@ -34,9 +34,18 @@ int main(int arg, char** argv){
     NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
 
     string rid = "Req-123";
+    string intro = client.getLeader();
     string response = client.getHello(rid);
 
     cout << response << endl;
+
+    cout<<endl;
+
+    cout<< "Getting Average Population" << endl;
+    int tCnt = 2;
+    string response2 = client.getPopulation(tCnt);
+
+
 
     return 0;
 }
