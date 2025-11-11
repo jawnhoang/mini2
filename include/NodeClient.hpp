@@ -22,13 +22,19 @@ using grpc::ClientWriter;
 using grpc::Status;
 
 using loop::RouteService;
+using loop::executeJob;
 using namespace std;
 
 class NodeClient{
     private:
         unique_ptr<RouteService::Stub> stub_;
+        unique_ptr<executeJob::Stub> jobStub_;
+
     public:
-        explicit NodeClient(std::shared_ptr<grpc::Channel> channel): stub_(RouteService::NewStub(channel)){}
+        explicit NodeClient(std::shared_ptr<grpc::Channel> channel): 
+                            stub_(RouteService::NewStub(channel)),
+                            jobStub_(executeJob::NewStub(channel))
+                            {}
 
         string getHello(const string& rid){
             loop::Request request;
@@ -54,6 +60,26 @@ class NodeClient{
             grpc::ClientContext context;
             
             grpc::Status status = stub_->DetermineLeader(&context, request, &response);
+
+            if(status.ok()){
+                return "end";
+            }else{
+                cerr << "RPC failed " << status.error_code() << " - " << status.error_message() << endl;
+                return "RPC_ERR";
+            }
+
+        }
+
+
+        string getPopulation(int &thrdcnt){
+            
+            loop::threadCnt threadcnt;
+            
+            threadcnt.set_tcnt(thrdcnt);
+            loop::Response response;
+            grpc::ClientContext context;
+            
+            grpc::Status status = jobStub_->getAvgPopulation(&context, threadcnt, &response);
 
             if(status.ok()){
                 return "end";

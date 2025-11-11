@@ -18,3 +18,14 @@ message Response {
     string rspid = 2; //responseId
 }
 
+
+
+service executeJob{
+    rpc getAvgPopulation(threadCnt) returns (Response); //Reads in a fire CSV and stores important datapoints as attributes in class objects
+
+}
+
+message threadCnt {
+    int32 tcnt = 4;
+
+}
