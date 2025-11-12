@@ -29,21 +29,36 @@ using namespace std;
 
 
 int main(int arg, char** argv){
-    string target = "127.0.0.1:50051";
+    // string target = "127.0.0.1:50051";
     
+    // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+
+    // string rid = "Req-123";
+    // string intro = client.getLeader();
+    // string response = client.getHello(rid);
+
+    // cout << response << endl;
+
+    // cout<<endl;
+    string root = "127.0.0.1:";
+    if (arg != 4){
+        cerr << "Tip: " << argv[0] << " <port/src> <dest> <''payload''>";
+        return 1;
+    }
+        // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+
+
+    // cout<< "Getting Average Population" << endl;
+    // int tCnt = 2;
+    // string response2 = client.getPopulation(tCnt);
+    string rid2 = "client:50051";
+    string src = "A";
+    string dest = argv[2];
+    string payload = argv[3];
+    string target = root + argv[1];
     NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
 
-    string rid = "Req-123";
-    string intro = client.getLeader();
-    string response = client.getHello(rid);
-
-    cout << response << endl;
-
-    cout<<endl;
-
-    cout<< "Getting Average Population" << endl;
-    int tCnt = 2;
-    string response2 = client.getPopulation(tCnt);
+    string rsp = client.sendMsg(src, dest, payload);
 
 
 

@@ -71,18 +71,22 @@ class NodeClient{
         }
 
 
-        string getPopulation(int &thrdcnt){
-            
-            loop::threadCnt threadcnt;
-            
-            threadcnt.set_tcnt(thrdcnt);
-            loop::Response response;
+        string sendMsg(const string& src, const string& dest, const string& payload){
+            loop::Msg msg;
+            loop::MsgResponse response;
             grpc::ClientContext context;
-            
-            grpc::Status status = jobStub_->getAvgPopulation(&context, threadcnt, &response);
 
+
+            msg.set_src(src);
+            msg.set_dest(dest);
+            msg.set_payload(payload);
+
+
+
+            grpc::Status status = jobStub_->sendMsg(&context, msg, &response);
+            
             if(status.ok()){
-                return "end";
+                return response.rspid();
             }else{
                 cerr << "RPC failed " << status.error_code() << " - " << status.error_message() << endl;
                 return "RPC_ERR";
