@@ -36,7 +36,7 @@ int main(int arg, char** argv){
 
 
     if (arg < 2){
-        cerr << "Tip: " << argv[0] << " <node_id>";
+        cerr << "Tip: " << argv[0] << " <node_id> <dest> <payload>";
         return 1;
     }
     
@@ -49,19 +49,6 @@ int main(int arg, char** argv){
         cerr << "Valid Args ['A', 'B', 'C', 'D', 'E', 'F']" << endl;
         return 1;
     }
-
-    // try{
-
-    //     NodeId node = ConfigFileLoader::loadConfig(Path, nodeId);
-    //     std::cout << "---------------------------------\n";
-    //     std::cout << "Node ID: " << node.id << std::endl;
-    //     std::cout << "Address: " << node.address << std::endl;
-    //     std::cout << "Peers:\n";
-    //     for (auto& p : node.peer_addrs) {
-    //         std::cout << "  " << p.first << " -> " << p.second << std::endl;
-    //     }
-    //     std::cout << "---------------------------------\n";
-    // }
 
     NodeId nodeInfo = ConfigFileLoader::loadConfig(Path, nodeId);
     NodeServer server(nodeInfo);

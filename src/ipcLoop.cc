@@ -20,7 +20,7 @@ static uint32_t fnv1a32(const std::string& s) {
 grpc::Status ipcLoop::Hello(grpc::ServerContext* context, const loop::Request* request, loop::Response* response)
 {
  //Test: Intro for all Nodes to arrive at memory point
-        string sharedVariable = "Hello, Welcome to the shared memory space!";
+        string sharedVariable = "Hello!";
         
         //individual threads will perform work here
         #if defined(USE_OPENMP) //Without the ifdef, why does this execute if i launch the no threaded server?
