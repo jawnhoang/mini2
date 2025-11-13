@@ -28,7 +28,7 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     cout << "[Node " << nodeInfo.id << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
 
     if(dest == nodeInfo.id){
-        response->set_rspid("Msg delievered to" + nodeInfo.id);
+        response->set_rspid("Msg delivered to " + nodeInfo.id);
         return Status::OK;
     }else{
      //forward to other peers from list
@@ -61,8 +61,8 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
         grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
 
         if(status.ok()){
-            cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid << ": " << response->rspid() << endl; 
-            response->set_rspid("Forwarded to Peer Node " + pid);
+            cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid << ": " << peerResp.rspid() << endl;
+            response->set_rspid(peerResp.rspid());
             return Status::OK;
         }else{
             cerr << "[Node " << nodeInfo.id << "] Unable to forward msg to Peer Node " << pid << " : " << status.error_message() << endl;

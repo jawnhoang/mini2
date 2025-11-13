@@ -63,11 +63,11 @@ class NodeServer{
             }
             cout << endl;
 
-
             //sample way for servers to talk to server peers at run time
             // peerStubs();
             // sendToPeer();
 
+            jobs.peerStubs();
             server->Wait();
         }
 

@@ -42,7 +42,7 @@ int main(int arg, char** argv){
     // cout<<endl;
     string root = "127.0.0.1:";
     if (arg != 4){
-        cerr << "Tip: " << argv[0] << " <port/src> <dest> <''payload''>";
+        cerr << "Tip: " << argv[0] << " <port/src> <dest> <'payload'>" << endl;
         return 1;
     }
         // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
@@ -59,8 +59,6 @@ int main(int arg, char** argv){
     NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
 
     string rsp = client.sendMsg(src, dest, payload);
-
-
-
+    cout << "[Client] Response: " << rsp << endl;
     return 0;
 }
