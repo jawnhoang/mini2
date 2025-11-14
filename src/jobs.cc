@@ -21,19 +21,28 @@ using namespace std;
 
 grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
 {
-    string src = msg->src();
-    string dest = msg->dest();
-    string pyld = msg->payload();
-    
-    cout << "[Node " << nodeInfo.id << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+    std::call_once(workerInitFlag, [this]() {
+        for (int i = 0; i < 2; i++) {
+            workers.emplace_back([this, i]() { this->workerLoop(i); });
+        }
+    });
 
-    if(dest == nodeInfo.id){
-        response->set_rspid("Msg delivered to " + nodeInfo.id);
-        return Status::OK;
-    }else{
-     //forward to other peers from list
-        return forwardToPeer(msg, response);
+    auto job = std::make_shared<Job>();
+    job->src = msg->src();
+    job->dest = msg->dest();
+    job->payload = msg->payload();
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        jobQueue.push(job);
     }
+    queueCv.notify_one();
+
+    std::unique_lock<std::mutex> lk(job->mtx);
+    job->cv.wait(lk, [job](){ return job->done; });
+
+    response->set_rspid(job->resultRspid);
+    return Status::OK;
 }
 
 //communicate with Peers
@@ -75,4 +84,57 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
     response->set_rspid("Path to " + msg->dest() + " not found.");
     return Status::OK;
 
+}
+
+void jobLoop::workerLoop(int workerId)
+{
+    for (;;) {
+        std::shared_ptr<Job> job;
+
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCv.wait(lock, [this](){ return stopping || !jobQueue.empty(); });
+            if (stopping && jobQueue.empty()) {
+                return;
+            }
+            job = jobQueue.front();
+            jobQueue.pop();
+        }
+
+        string src = job->src;
+        string dest = job->dest;
+        string pyld = job->payload;
+
+        cout << "[Node " << nodeInfo.id << "][Worker " << workerId << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+
+        string rspid;
+
+        if (dest == nodeInfo.id) {
+            std::ostringstream oss;
+            oss << "Msg delivered to " << nodeInfo.id << " (worker " << workerId << ")";
+            rspid = oss.str();
+        } else {
+            loop::Msg forwardMsg;
+            forwardMsg.set_src(src);
+            forwardMsg.set_dest(dest);
+            forwardMsg.set_payload(pyld);
+
+            loop::MsgResponse peerResp;
+            grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);
+            if (status.ok()) {
+                std::ostringstream oss;
+                oss << peerResp.rspid() << " (via " << nodeInfo.id << ", worker " << workerId << ")";
+                rspid = oss.str();
+            } else {
+                rspid = "Forwarding failed at node " + nodeInfo.id;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(job->mtx);
+            job->resultRspid = rspid;
+            job->done = true;
+        }
+        job->cv.notify_one();
+    }
 }

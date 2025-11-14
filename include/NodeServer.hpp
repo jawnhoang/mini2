@@ -49,6 +49,12 @@ class NodeServer{
             builder.RegisterService(&service);
             builder.RegisterService(&jobs);
             unique_ptr<grpc::Server> server(builder.BuildAndStart());
+            if (!server) {
+                std::cerr << "[Node " << nodeInfo.id << "] ERROR: Failed to start gRPC server on "
+                          << nodeInfo.addr << std::endl;
+                return;
+            }
+
             #if defined(USE_OPENMP)
             std::cout << "[Server] Using openmp" << std::endl;
             #else

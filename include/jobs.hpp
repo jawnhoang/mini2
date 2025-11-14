@@ -14,6 +14,11 @@
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h> 
 
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <vector>
 
 #include "config.hpp"
 
@@ -34,14 +39,34 @@ class jobLoop final : public executeJob::Service{
         NodeId nodeInfo;
         map<string, unique_ptr<executeJob::Stub>> jobStub_;
 
+        struct Job {
+            string src;
+            string dest;
+            string payload;
+            string resultRspid;
+            bool done = false;
+            std::mutex mtx;
+            std::condition_variable cv;
+        };
+
+        std::queue<std::shared_ptr<Job>> jobQueue;
+        std::mutex queueMutex;
+        std::condition_variable queueCv;
+        std::vector<std::thread> workers;
+        bool stopping = false;
+        std::once_flag workerInitFlag;
+
     public:
-        explicit jobLoop(const NodeId& nodeData): nodeInfo(nodeData){peerStubs();}
+        explicit jobLoop(const NodeId& nodeData): nodeInfo(nodeData){
+            peerStubs();
+        }
 
         Status sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response) override;
 
         void peerStubs();
 
         Status forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response);
+
+    private:
+        void workerLoop(int workerId);
 };
-
-
