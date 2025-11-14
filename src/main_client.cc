@@ -40,9 +40,10 @@ int main(int arg, char** argv){
     // cout << response << endl;
 
     // cout<<endl;
-    string root = "127.0.0.1:";
-    if (arg != 4){
-        cerr << "Tip: " << argv[0] << " <port/src> <dest> <'payload'>" << endl;
+    // string root = "169.254.223.138:";
+    //string root = "127.0.0.1:";
+    if (arg != 5){
+        cerr << "Tip: " << argv[0] << " <host> <port|auto> <dest> <'payload'>" << endl;
         return 1;
     }
         // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
@@ -53,12 +54,36 @@ int main(int arg, char** argv){
     // string response2 = client.getPopulation(tCnt);
     string rid2 = "client:50051";
     string src = "A";
-    string dest = argv[2];
-    string payload = argv[3];
-    string target = root + argv[1];
-    NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+    string host = argv[1];
+    string portArg = argv[2];
+    string dest = argv[3];
+    string payload = argv[4];
 
-    string rsp = client.sendMsg(src, dest, payload);
+    string rsp;
+    if (portArg == string("auto")) {
+        const string candidatePorts[] = {"50051", "50052", "50053", "50054", "50055"};
+        bool delivered = false;
+        for (const auto& p : candidatePorts) {
+            string target = host + string(":") + p;
+            cout << "[Client] Trying " << target << endl;
+            NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+            rsp = client.sendMsg(src, dest, payload);
+            if (rsp != "RPC_ERR") {
+                delivered = true;
+                break;
+            }
+        }
+        if (!delivered) {
+            cout << "[Client] No reachable server found on candidate ports" << endl;
+            return 1;
+        }
+    } else {
+        string target = host + string(":") + portArg;
+        cout << "[Client] Trying " << target << endl;
+        NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+        rsp = client.sendMsg(src, dest, payload);
+    }
+
     cout << "[Client] Response: " << rsp << endl;
     return 0;
 }
