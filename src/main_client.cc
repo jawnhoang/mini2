@@ -68,12 +68,17 @@ int main(int arg, char** argv){
             string target = host + string(":") + p;
             cout << "[Client] Trying " << target << endl;
             //try catch - can this be sped up if the servers are not up? ie, only B, C
-            NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
-            rsp = client.sendMsg(src, dest, payload);
-            if (rsp != "RPC_ERR") {
-                delivered = true;
-                break;
+            // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+            auto chnl = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+            if(chnl->GetState(true) == GRPC_CHANNEL_READY){
+                NodeClient client(chnl);
+                rsp = client.sendMsg(src, dest, payload);
+                if (rsp != "RPC_ERR") {
+                    delivered = true;
+                    break;
+                }                
             }
+
         }
         if (!delivered) {
             cout << "[Client] No reachable server found on candidate ports" << endl;
