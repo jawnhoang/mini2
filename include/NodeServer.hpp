@@ -49,6 +49,7 @@ class NodeServer{
             builder.RegisterService(&service);
             builder.RegisterService(&jobs);
             unique_ptr<grpc::Server> server(builder.BuildAndStart());
+            
             if (!server) {
                 std::cerr << "[Node " << nodeInfo.id << "] ERROR: Failed to start gRPC server on "
                           << nodeInfo.addr << std::endl;
@@ -72,8 +73,8 @@ class NodeServer{
             //sample way for servers to talk to server peers at run time
             // peerStubs();
             // sendToPeer();
-
             jobs.peerStubs();
+            jobs.runHandshake();
             server->Wait();
         }
 

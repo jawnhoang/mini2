@@ -21,6 +21,10 @@ using namespace std;
 
 grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
 {
+    // LEADER: gRPC entrypoint. This thread only:
+    //  1) Enqueues the incoming message as a Job into the internal queue.
+    //  2) Waits for a worker thread to process it.
+    //  3) Returns the result set by the worker (no forwarding logic here).
     std::call_once(workerInitFlag, [this]() {
         for (int i = 0; i < 2; i++) {
             workers.emplace_back([this, i]() { this->workerLoop(i); });
@@ -41,53 +45,125 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     std::unique_lock<std::mutex> lk(job->mtx);
     job->cv.wait(lk, [job](){ return job->done; });
 
+    // Leader: jobLoop::sendMsg only waits for a worker to finish and returns
+    // whatever result the worker computed. All routing/forwarding decisions
+    // are made inside workerLoop() on the server side.
     response->set_rspid(job->resultRspid);
     return Status::OK;
 }
 
 //communicate with Peers
 void jobLoop::peerStubs(){
-    for(const auto& [pid, paddr] : nodeInfo.peer_addr){
-        if(pid == nodeInfo.id){
+    for (const auto& [pid, paddr] : nodeInfo.peer_addr) {
+        if (pid == nodeInfo.id) {
+            continue;   // don't create a stub to self
+        }
+        if (jobStub_.count(pid)) {
+            // stub already created earlier, skip so we don't double-print
             continue;
         }
-        jobStub_[pid] = executeJob::NewStub(grpc::CreateChannel(paddr, grpc::InsecureChannelCredentials()));
+
+        jobStub_[pid] = executeJob::NewStub(
+            grpc::CreateChannel(paddr, grpc::InsecureChannelCredentials()));
         cout << "[Node] Stub for Peer " << pid << " created at " << paddr << endl;
+    }
+}
+
+void jobLoop::runHandshake(){
+    for (const auto& [pid, stub] : jobStub_) {
+        loop::Msg msg;
+        msg.set_src(nodeInfo.id);
+        msg.set_dest(pid);
+        msg.set_payload("__HELLO__" + nodeInfo.addr);
+
+        grpc::ClientContext ctx;
+        loop::MsgResponse resp;
+
+        cout << "[Node " << nodeInfo.id << "] Sending HELLO to peer "
+             << pid << " with addr " << nodeInfo.addr << endl;
+
+        grpc::Status status = stub->sendMsg(&ctx, msg, &resp);
+        if (status.ok()) {
+            cout << "[Node " << nodeInfo.id << "] HELLO ack from peer "
+                 << pid << ": " << resp.rspid() << endl;
+        } else {
+            cerr << "[Node " << nodeInfo.id << "] HELLO to peer " << pid
+                 << " failed: " << status.error_message() << endl;
+        }
     }
 }
 
 //in a way, server becomes a client if its forwarding msgs
 grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response){
-    for(const auto& [pid, stub] : jobStub_){ //cycles through list of mapped Ids and addresses
-        if(pid == msg->src()){
+    const std::string& dest    = msg->dest();
+    const std::string& origSrc = msg->src();
+
+    // 1. Prefer a direct edge to the destination if it exists
+    auto directIt = jobStub_.find(dest);
+    if (directIt != jobStub_.end()) {
+        cout << "[Node " << nodeInfo.id
+             << "] Forwarding Msg directly to dest Peer " << dest << endl;
+
+        grpc::ClientContext context;
+        loop::MsgResponse peerResp;
+        grpc::Status status = directIt->second->sendMsg(&context, *msg, &peerResp);
+
+        if (status.ok()) {
+            cout << "[Node " << nodeInfo.id << "] reply from direct Peer " << dest
+                 << ": " << peerResp.rspid() << endl;
+            response->set_rspid(peerResp.rspid());
+            return Status::OK;
+        } else {
+            cerr << "[Node " << nodeInfo.id
+                 << "] Unable to forward msg directly to Peer "
+                 << dest << " : " << status.error_message() << endl;
+            // fall through to try other peers as backup
+        }
+    }
+
+    // 2. Otherwise, or if direct failed, try other peers as next hops
+    for (const auto& [pid, stub] : jobStub_) {
+        // avoid immediately bouncing back to where it came from
+        if (pid == origSrc) {
             continue;
         }
+        // we already tried sending directly to dest above
+        if (pid == dest) {
+            continue;
+        }
+
         cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
 
         grpc::ClientContext context;
         loop::MsgResponse peerResp;
-
         grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
 
-        if(status.ok()){
-            cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid << ": " << peerResp.rspid() << endl;
+        if (status.ok()) {
+            cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid
+                 << ": " << peerResp.rspid() << endl;
             response->set_rspid(peerResp.rspid());
             return Status::OK;
-        }else{
-            cerr << "[Node " << nodeInfo.id << "] Unable to forward msg to Peer Node " << pid << " : " << status.error_message() << endl;
+        } else {
+            cerr << "[Node " << nodeInfo.id << "] Unable to forward msg to Peer Node "
+                 << pid << " : " << status.error_message() << endl;
         }
     }
 
-    //if loop looking for available peers completes
-    // then no peers exist
-    cerr << "[Node " << nodeInfo.id << "] No Peer available to reach" << endl;
-    response->set_rspid("Path to " + msg->dest() + " not found.");
+    // If we got here, no peer could be used to reach dest
+    cerr << "[Node " << nodeInfo.id << "] No Peer available to reach dest "
+         << dest << endl;
+    response->set_rspid("Path to " + dest + " not found.");
     return Status::OK;
-
 }
 
 void jobLoop::workerLoop(int workerId)
 {
+    // WORKERS: background threads that pull Jobs from the internal queue.
+    // Each worker:
+    //  1) Waits on queueCv for new jobs.
+    //  2) Processes local messages or handshake messages.
+    //  3) If the destination is another node, forwards the message using
+    //     forwardToPeer() and records the result back into the Job.
     for (;;) {
         std::shared_ptr<Job> job;
 
@@ -105,15 +181,38 @@ void jobLoop::workerLoop(int workerId)
         string dest = job->dest;
         string pyld = job->payload;
 
-        cout << "[Node " << nodeInfo.id << "][Worker " << workerId << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+        cout << "[Node " << nodeInfo.id << "][Worker " << workerId
+             << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
 
         string rspid;
 
-        if (dest == nodeInfo.id) {
-            std::ostringstream oss;
-            oss << "Msg delivered to " << nodeInfo.id << " (worker " << workerId << ")";
+        const string helloPrefix = "__HELLO__";
+        if (pyld.rfind(helloPrefix, 0) == 0) {
+            // Handshake message: "__HELLO__<ip:port>"
+            string peerAddr = pyld.substr(helloPrefix.size());
+            nodeInfo.peer_addr[src] = peerAddr;
+            cout << "[Node " << nodeInfo.id
+                << "] Connected to peer " << src
+                << " at " << peerAddr << endl;
+
+            job->needsForward = false;
+
+            ostringstream oss;
+            oss << "HELLO-ACK-from-" << nodeInfo.id
+                << " (worker " << workerId << ")";
+            rspid = oss.str();
+        } else if (dest == nodeInfo.id) {
+            // Local delivery only
+            job->needsForward = false;
+
+            ostringstream oss;
+            oss << "Msg delivered to " << nodeInfo.id
+                << " (worker " << workerId << ")";
             rspid = oss.str();
         } else {
+            // Worker role: this node is not the final destination, so the worker
+            // is responsible for forwarding the message along the overlay using
+            // forwardToPeer(). The leader never calls forwardToPeer directly.
             loop::Msg forwardMsg;
             forwardMsg.set_src(src);
             forwardMsg.set_dest(dest);
@@ -122,11 +221,15 @@ void jobLoop::workerLoop(int workerId)
             loop::MsgResponse peerResp;
             grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);
             if (status.ok()) {
-                std::ostringstream oss;
-                oss << peerResp.rspid() << " (via " << nodeInfo.id << ", worker " << workerId << ")";
+                ostringstream oss;
+                oss << peerResp.rspid() << " (via " << nodeInfo.id
+                    << ", worker " << workerId << ")";
                 rspid = oss.str();
             } else {
-                rspid = "Forwarding failed at node " + nodeInfo.id;
+                ostringstream oss;
+                oss << "Forwarding failed at node " << nodeInfo.id
+                    << " (worker " << workerId << ")";
+                rspid = oss.str();
             }
         }
 
