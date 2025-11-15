@@ -73,7 +73,7 @@ class NodeServer{
             // peerStubs();
             // sendToPeer();
 
-            jobs.peerStubs();
+            // jobs.peerStubs();
             server->Wait();
         }
 

@@ -21,14 +21,50 @@ using namespace std;
 
 grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
 {
+    //determine src
+    string portArg = msg->src();
+    // cout << portArg;
+    string src;
+    // cout<<nodeInfo.addr << endl;
+    string nodePort = nodeInfo.addr.substr(nodeInfo.addr.size() - 5);
+    if(nodePort == portArg){
+        src = nodeInfo.id;
+    }
+    for(const auto& [pid, paddr] : nodeInfo.peer_addr){
+        string port = paddr.substr(paddr.size()-5); // gets only port
+        // cout<<port<<endl;
+        if(port == portArg){
+            src = pid;
+            cout << "Client " << src << " Sending msg...";
+            break;
+        }
+    }
+
+    //msg = 5005#
+    //paddr = 127.0.0.1:5005X
+    // for(const auto& [pid, paddr] : nodeInfo.peer_addr){
+    //     string port = paddr.substr(paddr.find_last_of(':')+1); // gets only port
+    //     cout<<port<<endl;
+    //     if(port == portArg){
+    //         src = pid;
+    //         cout << "Client " << src << " Sending msg...";
+    //         break;
+    //     }
+    // }
+
+    // if (src.empty()) {
+    //     std::cerr << "[Node " << nodeInfo.id << "] Warning: could not map incoming port " 
+    //             << portArg << " to node ID\n";
+    //     src = portArg;  // fallback
+    // }
     std::call_once(workerInitFlag, [this]() {
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 1; i++) { 
             workers.emplace_back([this, i]() { this->workerLoop(i); });
         }
     });
 
     auto job = std::make_shared<Job>();
-    job->src = msg->src();
+    job->src = src;
     job->dest = msg->dest();
     job->payload = msg->payload();
 
@@ -105,7 +141,7 @@ void jobLoop::workerLoop(int workerId)
         string dest = job->dest;
         string pyld = job->payload;
 
-        cout << "[Node " << nodeInfo.id << "][Worker " << workerId << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+        cout << "[Node " << nodeInfo.id << "][Worker " << workerId << "] Msg received from [Node " << src << "]: " << pyld << endl;
 
         string rspid;
 

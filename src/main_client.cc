@@ -52,13 +52,14 @@ int main(int arg, char** argv){
     // cout<< "Getting Average Population" << endl;
     // int tCnt = 2;
     // string response2 = client.getPopulation(tCnt);
-    string rid2 = "client:50051";
-    string src = "A";
+    // string rid2 = "client:50051";
+    // string src = "A";
     string host = argv[1];
     string portArg = argv[2];
     string dest = argv[3];
     string payload = argv[4];
 
+    string src = portArg;
     string rsp;
     if (portArg == string("auto")) {
         const string candidatePorts[] = {"50051", "50052", "50053", "50054", "50055"};
@@ -66,6 +67,7 @@ int main(int arg, char** argv){
         for (const auto& p : candidatePorts) {
             string target = host + string(":") + p;
             cout << "[Client] Trying " << target << endl;
+            //try catch - can this be sped up if the servers are not up? ie, only B, C
             NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
             rsp = client.sendMsg(src, dest, payload);
             if (rsp != "RPC_ERR") {
