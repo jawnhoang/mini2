@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "NodeClient.hpp"
 
@@ -28,7 +29,7 @@ using loop::RouteService;
 using namespace std;
 
 
-int main(int arg, char** argv){
+int main(int argc, char** argv){
     // string target = "127.0.0.1:50051";
     
     // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
@@ -41,49 +42,53 @@ int main(int arg, char** argv){
 
     // cout<<endl;
     // string root = "169.254.223.138:";
-    //string root = "127.0.0.1:";
-    if (arg != 5){
-        cerr << "Tip: " << argv[0] << " <host> <port|auto> <dest> <'payload'>" << endl;
+    //string root = "127.0.0.1:";   
+   
+    // Expecting: ./loop-client <host> <src_id> <dest_id> <'payload'>
+    if (argc != 5){
+        cerr << "Tip: " << argv[0]
+             << " <host> <src_id> <dest_id> <'payload'>" << endl;
         return 1;
     }
-        // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+    // NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
 
 
     // cout<< "Getting Average Population" << endl;
     // int tCnt = 2;
     // string response2 = client.getPopulation(tCnt);
-    string rid2 = "client:50051";
-    string src = "A";
-    string host = argv[1];
-    string portArg = argv[2];
-    string dest = argv[3];
-    string payload = argv[4];
 
-    string rsp;
-    if (portArg == string("auto")) {
-        const string candidatePorts[] = {"50051", "50052", "50053", "50054", "50055"};
-        bool delivered = false;
-        for (const auto& p : candidatePorts) {
-            string target = host + string(":") + p;
-            cout << "[Client] Trying " << target << endl;
-            NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
-            rsp = client.sendMsg(src, dest, payload);
-            if (rsp != "RPC_ERR") {
-                delivered = true;
-                break;
-            }
-        }
-        if (!delivered) {
-            cout << "[Client] No reachable server found on candidate ports" << endl;
-            return 1;
-        }
-    } else {
-        string target = host + string(":") + portArg;
-        cout << "[Client] Trying " << target << endl;
+    
+    // External clients always send to the local entry node.
+    // The overlay and leader/worker servers decide how to route it.
+    // std::string host = "127.0.0.1"
+    // std::string port = "50051"; 
+    
+    std::string host = argv[1];        // entry node host (no hardcoded IP)
+    std::string src = argv[2];         // logical source node id, e.g. "A"
+    std::string dest = argv[3];        // logical destination node id, e.g. "F"
+    std::string payload = argv[4];     // message body
+
+    // Auto-try ports 50051–50055 on the given host.
+    std::vector<std::string> ports = {"50051", "50052", "50053", "50054", "50055"};
+
+    std::string rsp = "RPC_ERR";
+
+    std::cout << "[Client] Ports: ";
+
+    for (const auto& p : ports) {
+        std::cout << p << " ";
+        std::string target = host + ":" + p;
         NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
         rsp = client.sendMsg(src, dest, payload);
+        if (rsp != "RPC_ERR") {
+            std::cout << "(ok)" << std::endl;
+            std::cout << "[Client] Response: " << rsp << std::endl;
+            return 0; // done on first successful port
+        }
     }
 
-    cout << "[Client] Response: " << rsp << endl;
-    return 0;
+    // If here, no port worked.
+    std::cout << "(all failed)" << std::endl;
+    std::cout << "[Client] Response: " << rsp << std::endl;
+    return 1;
 }

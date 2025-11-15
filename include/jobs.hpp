@@ -45,6 +45,7 @@ class jobLoop final : public executeJob::Service{
             string payload;
             string resultRspid;
             bool done = false;
+            bool needsForward = false;
             std::mutex mtx;
             std::condition_variable cv;
         };
@@ -64,6 +65,9 @@ class jobLoop final : public executeJob::Service{
         Status sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response) override;
 
         void peerStubs();
+
+        // NEW:
+        void runHandshake();
 
         Status forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response);
 
