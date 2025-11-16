@@ -3,28 +3,19 @@
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
+#include <chrono>
 
-// simple FNV-1a 32-bit checksum so we avoid extra libs
-static uint32_t fnv1a32(const std::string& s) {
-    const uint32_t FNV_OFFSET = 2166136261u;
-    const uint32_t FNV_PRIME  = 16777619u;
-    uint32_t hash = FNV_OFFSET;
-    for (unsigned char c : s) {
-        hash ^= c;
-        hash *= FNV_PRIME;
-    }
-    return hash;
+namespace {
+    std::map<std::string, bool> peerAlive;
+    std::mutex peerAliveMutex;
 }
-
 
 using namespace std;
 
-grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
+Status jobLoop::sendMsg(::grpc::ServerContext* context,
+                        const ::loop::Msg* msg,
+                        ::loop::MsgResponse* response)
 {
-    // LEADER: gRPC entrypoint. This thread only:
-    //  1) Enqueues the incoming message as a Job into the internal queue.
-    //  2) Waits for a worker thread to process it.
-    //  3) Returns the result set by the worker (no forwarding logic here).
     std::call_once(workerInitFlag, [this]() {
         for (int i = 0; i < 2; i++) {
             workers.emplace_back([this, i]() { this->workerLoop(i); });
@@ -36,20 +27,33 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     job->dest = msg->dest();
     job->payload = msg->payload();
 
+    // External if it came from the real client
+    job->isExternal = (job->src == "CLIENT");
+
+    // Give every job a simple uid
+    static std::atomic<uint64_t> uidCounter{0};
+    job->uid = nodeInfo.id + "-" + std::to_string(uidCounter++);
+
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         jobQueue.push(job);
     }
     queueCv.notify_one();
 
-    std::unique_lock<std::mutex> lk(job->mtx);
-    job->cv.wait(lk, [job](){ return job->done; });
+    if (job->isExternal) {
+        // Leader behavior for external jobs:
+        // enqueue and immediately return the uid to the client
+        response->set_rspid(job->uid);
+        return Status::OK;
+    } else {
+        // Internal server-to-server call:
+        // keep the current behavior, wait for worker result
+        std::unique_lock<std::mutex> lk(job->mtx);
+        job->cv.wait(lk, [job](){ return job->done; });
 
-    // Leader: jobLoop::sendMsg only waits for a worker to finish and returns
-    // whatever result the worker computed. All routing/forwarding decisions
-    // are made inside workerLoop() on the server side.
-    response->set_rspid(job->resultRspid);
-    return Status::OK;
+        response->set_rspid(job->resultRspid);
+        return Status::OK;
+    }
 }
 
 //communicate with Peers
@@ -65,6 +69,10 @@ void jobLoop::peerStubs(){
 
         jobStub_[pid] = executeJob::NewStub(
             grpc::CreateChannel(paddr, grpc::InsecureChannelCredentials()));
+        {
+            std::lock_guard<std::mutex> lk(peerAliveMutex);
+            peerAlive[pid] = true;
+        }
         cout << "[Node] Stub for Peer " << pid << " created at " << paddr << endl;
     }
 }
@@ -93,20 +101,85 @@ void jobLoop::runHandshake(){
     }
 }
 
+// Helper: send a message to a peer stub, and if it fails, retry once using
+// the latest address from nodeInfo.peer_addr (if available).
+grpc::Status jobLoop::sendWithOptionalRetry(
+    const std::string& pid,
+    std::unique_ptr<executeJob::Stub>& stub,
+    const ::loop::Msg* msg,
+    ::loop::MsgResponse* peerResp)
+{
+    // First attempt with the existing stub
+    grpc::ClientContext ctx;
+    auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(300);
+    ctx.set_deadline(deadline);
+    grpc::Status status = stub->sendMsg(&ctx, *msg, peerResp);
+    if (status.ok()) {
+        return status;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(peerAliveMutex);
+        peerAlive[pid] = false;
+    }
+
+    // Look up the latest known address for this peer
+    auto addrIt = nodeInfo.peer_addr.find(pid);
+    if (addrIt == nodeInfo.peer_addr.end()) {
+        // No newer address stored; return original failure
+        return status;
+    }
+
+    const std::string& peerAddr = addrIt->second;
+    cout << "[Node " << nodeInfo.id << "] Retrying forward to Peer Node "
+         << pid << " using addr " << peerAddr << endl;
+
+    auto retryStub = executeJob::NewStub(
+        grpc::CreateChannel(peerAddr, grpc::InsecureChannelCredentials()));
+
+    grpc::ClientContext retryCtx;
+    auto retryDeadline = std::chrono::system_clock::now() + std::chrono::milliseconds(300);
+    retryCtx.set_deadline(retryDeadline);
+    loop::MsgResponse retryResp;
+    grpc::Status retryStatus = retryStub->sendMsg(&retryCtx, *msg, &retryResp);
+
+    if (retryStatus.ok()) {
+        {
+            std::lock_guard<std::mutex> lk(peerAliveMutex);
+            peerAlive[pid] = true;
+        }
+        // On success, copy the retried response into the caller's response
+        *peerResp = retryResp;
+        return retryStatus;
+    }
+
+    cerr << "[Node " << nodeInfo.id << "] retry to Peer " << pid
+         << " failed: " << retryStatus.error_message() << endl;
+    return retryStatus;
+}
+
 //in a way, server becomes a client if its forwarding msgs
 grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response){
     const std::string& dest    = msg->dest();
     const std::string& origSrc = msg->src();
 
-    // 1. Prefer a direct edge to the destination if it exists
+    bool directAlive = true;
+    {
+        std::lock_guard<std::mutex> lk(peerAliveMutex);
+        auto it = peerAlive.find(dest);
+        if (it != peerAlive.end()) {
+            directAlive = it->second;
+        }
+    }
+
+    // 1. Prefer a direct edge to the destination if it exists and is alive
     auto directIt = jobStub_.find(dest);
-    if (directIt != jobStub_.end()) {
+    if (directIt != jobStub_.end() && directAlive) {
         cout << "[Node " << nodeInfo.id
              << "] Forwarding Msg directly to dest Peer " << dest << endl;
 
-        grpc::ClientContext context;
         loop::MsgResponse peerResp;
-        grpc::Status status = directIt->second->sendMsg(&context, *msg, &peerResp);
+        grpc::Status status = sendWithOptionalRetry(dest, directIt->second, msg, &peerResp);
 
         if (status.ok()) {
             cout << "[Node " << nodeInfo.id << "] reply from direct Peer " << dest
@@ -131,12 +204,18 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
         if (pid == dest) {
             continue;
         }
+        {
+            std::lock_guard<std::mutex> lk(peerAliveMutex);
+            auto it = peerAlive.find(pid);
+            if (it != peerAlive.end() && !it->second) {
+                continue;
+            }
+        }
 
         cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
 
-        grpc::ClientContext context;
         loop::MsgResponse peerResp;
-        grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
+        grpc::Status status = sendWithOptionalRetry(pid, const_cast<std::unique_ptr<executeJob::Stub>&>(stub), msg, &peerResp);
 
         if (status.ok()) {
             cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid
@@ -214,7 +293,8 @@ void jobLoop::workerLoop(int workerId)
             // is responsible for forwarding the message along the overlay using
             // forwardToPeer(). The leader never calls forwardToPeer directly.
             loop::Msg forwardMsg;
-            forwardMsg.set_src(src);
+            //forwardMsg.set_src(src);
+            forwardMsg.set_src(nodeInfo.id);
             forwardMsg.set_dest(dest);
             forwardMsg.set_payload(pyld);
 

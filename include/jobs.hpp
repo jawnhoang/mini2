@@ -43,6 +43,12 @@ class jobLoop final : public executeJob::Service{
             string src;
             string dest;
             string payload;
+            // Mark whether this came from an external client
+            bool isExternal = false;
+
+            // For later chunking / tracking
+            string uid;
+
             string resultRspid;
             bool done = false;
             bool needsForward = false;
@@ -69,6 +75,11 @@ class jobLoop final : public executeJob::Service{
         // NEW:
         void runHandshake();
 
+        Status sendWithOptionalRetry(
+            const std::string& pid,
+            std::unique_ptr<executeJob::Stub>& stub,
+            const ::loop::Msg* msg,
+            ::loop::MsgResponse* peerResp);
         Status forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response);
 
     private:

@@ -81,7 +81,10 @@ class NodeClient{
             msg.set_dest(dest);
             msg.set_payload(payload);
 
-
+            // Treat all client-originated messages as external jobs
+            msg.set_src("CLIENT");
+            msg.set_dest(dest);
+            msg.set_payload(payload);
 
             grpc::Status status = jobStub_->sendMsg(&context, msg, &response);
             
