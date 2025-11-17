@@ -21,7 +21,8 @@
 #include <vector>
 
 #include "config.hpp"
-
+#include "WorldDataParser.hpp"
+#include "Stopwatch.hpp"
 // generated code
 #include "route.grpc.pb.h"
 
@@ -38,6 +39,7 @@ class jobLoop final : public executeJob::Service{
     private:
         NodeId nodeInfo;
         map<string, unique_ptr<executeJob::Stub>> jobStub_;
+        Stopwatch timer;
 
         struct Job {
             string src;

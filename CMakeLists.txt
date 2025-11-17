@@ -107,7 +107,7 @@ target_link_libraries(loop_lib PUBLIC
 # app targets
 include_directories(include)
 
-add_executable(loop-server src/main_server.cc src/ipcLoop.cc src/jobs.cc)
+add_executable(loop-server src/main_server.cc src/ipcLoop.cc src/jobs.cc src/WorldDataParser.cc)
 target_compile_definitions(loop-server PRIVATE USE_OPENMP)
 
 # ---- OpenMP setup per platform ----
