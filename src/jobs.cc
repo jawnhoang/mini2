@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
-
+#include <chrono>
 
 // simple FNV-1a 32-bit checksum so we avoid extra libs
 static uint32_t fnv1a32(const std::string& s) {
@@ -22,6 +22,7 @@ using namespace std;
 
 grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
 {
+    auto start = chrono::high_resolution_clock::now();
     // LEADER: gRPC entrypoint. This thread only:
     //  1) Enqueues the incoming message as a Job into the internal queue.
     //  2) Waits for a worker thread to process it.
@@ -50,6 +51,18 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     // whatever result the worker computed. All routing/forwarding decisions
     // are made inside workerLoop() on the server side.
     response->set_rspid(job->resultRspid);
+    
+    auto stop = chrono::high_resolution_clock::now();
+    string timerMsg = "Execution time:";
+    auto executionDuration = chrono::duration_cast<chrono::milliseconds>(stop-start).count();
+    cout<<"------------------" << endl;
+    if(executionDuration < 2){
+        auto executionDurationNS = chrono::duration_cast<chrono::nanoseconds>(stop-start).count();
+        cout<< timerMsg<< ": " << executionDurationNS << "ns" << endl;
+    }else{
+        cout<< timerMsg<< ": " << executionDuration << "ms" << endl;
+    }
+    cout<<"------------------" << endl;
     return Status::OK;
 }
 
@@ -218,9 +231,10 @@ void jobLoop::workerLoop(int workerId)
                 
                 vector<int> columnIdx = {0, 5, 68};// cols: country name, 1960, 1968
                 int rowStart = 5; // skip header rows
-
+                
+                cout << "[Worker " << workerId << "] Performing calculations" << endl;
                 parser.calculateAvgPop1930_1968(csvData, columnIdx, rowStart);
-
+                cout << "[Worker " << workerId << "] Completed. Returning results to Node "<< src << endl;
                 // convert to a single string
                 ostringstream oss;
                 for (const auto& e : parser.getCountryToAvgPop()) {
