@@ -4,6 +4,9 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 
 // simple FNV-1a 32-bit checksum so we avoid extra libs
 static uint32_t fnv1a32(const std::string& s) {
@@ -200,9 +203,21 @@ void jobLoop::workerLoop(int workerId)
 
         string rspid;
 
+        const string fireChunkPrefix = "__FIRECHUNK__|";
         const string helloPrefix = "__HELLO__";
         const string getPopPref = "getAvgPop";
-        if (pyld.rfind(helloPrefix, 0) == 0) {
+        const string getFirePref = "getFireStats";
+        
+        if (pyld.rfind(fireChunkPrefix, 0) == 0) {
+            // Internal “chunk” message coming back to the leader.
+            job->needsForward = false;
+
+            cout << "[Node " << nodeInfo.id << "][Worker " << workerId
+                << "] Received fire chunk from [" << src << "]: "
+                << pyld << endl;
+
+            rspid = "FIRE-CHUNK-ACK";
+        }if (pyld.rfind(helloPrefix, 0) == 0) {
             // Handshake message: "__HELLO__<ip:port>"
             string peerAddr = pyld.substr(helloPrefix.size());
             nodeInfo.peer_addr[src] = peerAddr;
@@ -217,22 +232,23 @@ void jobLoop::workerLoop(int workerId)
                 << " (worker " << workerId << ")";
             rspid = oss.str();
         }else if (pyld.rfind(getPopPref,0) == 0 && dest == nodeInfo.id) {
-             // Only do this for local delivery
-            job->needsForward = false;
+                // Only do this for local delivery
+                job->needsForward = false;
     
-            try {
-                cout << "[Worker " << workerId << "] Attempting to read..." << endl;
+                try {
+                    cout << "[Worker " << workerId << "] Attempting to read..." << endl;
 
                 WorldDataParser parser;
                 string filePath = "../dataset/world/populations.csv";
                 auto csvData = parser.read(filePath);
                 cout << "[Worker " << workerId << "]Read in "<< csvData.size() << " rows" << endl;
 
-                
+
                 vector<int> columnIdx = {0, 5, 68};// cols: country name, 1960, 1968
                 int rowStart = 5; // skip header rows
-                
-                cout << "[Worker " << workerId << "] Performing calculations" << endl;
+
+
+                                cout << "[Worker " << workerId << "] Performing calculations" << endl;
                 parser.calculateAvgPop1930_1968(csvData, columnIdx, rowStart);
                 cout << "[Worker " << workerId << "] Completed. Returning results to Node "<< src << endl;
                 // convert to a single string
@@ -245,8 +261,138 @@ void jobLoop::workerLoop(int workerId)
 
                 job->resultRspid = rsp;
                 rspid = rsp;
-            } catch (const exception& e) {
+                } catch (const exception& e) {
                 job->resultRspid = string("Error reading CSV: ") + e.what();
+                }
+        }else if (pyld.rfind(getFirePref,0) == 0 && dest == nodeInfo.id) {
+            // NEW: chunked fire stats
+            job->needsForward = false;
+
+            try {
+                namespace fs = std::filesystem;
+                string baseDir = "../dataset/fires";
+
+                const long chunkSize = 5000;   // rows per chunk
+                long chunkId = 0;
+
+                double chunkSum = 0.0;
+                long   chunkCount = 0;
+                double chunkMax = -1e9;
+
+                double globalSum = 0.0;
+                long   globalCount = 0;
+                double globalMax = -1e9;
+
+                // helper to send one chunk back to leader A
+                auto sendChunkToLeader = [&](long cid,
+                                            double partialSum,
+                                            long partialCount,
+                                            double partialMax) {
+                    if (partialCount == 0) return;
+
+                    auto it = jobStub_.find("A");  // leader assumed "A"
+                    if (it == jobStub_.end()) {
+                        cout << "[Node " << nodeInfo.id
+                            << "] No stub for leader A; skipping chunk send.\n";
+                        return;
+                    }
+
+                    loop::Msg cmsg;
+                    cmsg.set_src(nodeInfo.id);
+                    cmsg.set_dest("A");
+
+                    std::ostringstream os;
+                    os << "__FIRECHUNK__|" << cid
+                    << "|" << partialSum
+                    << "|" << partialCount
+                    << "|" << partialMax;
+                    cmsg.set_payload(os.str());
+
+                    loop::MsgResponse cresp;
+                    grpc::ClientContext ctx;
+                    auto status = it->second->sendMsg(&ctx, cmsg, &cresp);
+                    if (!status.ok()) {
+                        cout << "[Node " << nodeInfo.id
+                            << "] Failed to send fire chunk " << cid
+                            << " to leader A: "
+                            << status.error_message() << endl;
+                    }
+                };
+
+                // Walk dataset/fires/<date>/*.csv
+                for (const auto& dayDir : fs::directory_iterator(baseDir)) {
+                    if (!dayDir.is_directory()) continue;
+
+                    for (const auto& csvPath : fs::directory_iterator(dayDir)) {
+                        if (!csvPath.is_regular_file()) continue;
+
+                        std::ifstream in(csvPath.path());
+                        if (!in.is_open()) continue;
+
+                        std::string line;
+                        while (std::getline(in, line)) {
+                            if (line.empty()) continue;
+
+                            std::stringstream ss(line);
+                            std::string field;
+                            std::vector<std::string> cols;
+                            while (std::getline(ss, field, ',')) {
+                                if (!field.empty() &&
+                                    field.front() == '"' &&
+                                    field.back() == '"') {
+                                    field = field.substr(1, field.size() - 2);
+                                }
+                                cols.push_back(field);
+                            }
+                            if (cols.size() <= 4) continue;
+
+                            try {
+                                double val = std::stod(cols[4]);  // use column 5 as value
+
+                                // update chunk
+                                chunkSum   += val;
+                                chunkCount += 1;
+                                if (val > chunkMax) chunkMax = val;
+
+                                // update global
+                                globalSum   += val;
+                                globalCount += 1;
+                                if (val > globalMax) globalMax = val;
+                            } catch (...) {
+                                continue;
+                            }
+
+                            if (chunkCount >= chunkSize) {
+                                sendChunkToLeader(chunkId, chunkSum, chunkCount, chunkMax);
+                                chunkId++;
+                                chunkSum = 0.0;
+                                chunkCount = 0;
+                                chunkMax = -1e9;
+                            }
+                        }
+                    }
+                }
+
+                // flush last partial chunk
+                if (chunkCount > 0) {
+                    sendChunkToLeader(chunkId, chunkSum, chunkCount, chunkMax);
+                }
+
+                double avg = (globalCount > 0)
+                    ? (globalSum / static_cast<double>(globalCount))
+                    : 0.0;
+
+                std::ostringstream final;
+                final << "FireStats avg=" << avg
+                    << ", count=" << globalCount
+                    << ", max=" << globalMax;
+
+                job->resultRspid = final.str();
+                rspid = job->resultRspid;
+            } catch (const std::exception& e) {
+                job->resultRspid =
+                    std::string("Error computing fire stats: ") + e.what();
+                rspid = job->resultRspid;
             }
         }else if (dest == nodeInfo.id) {
             // Local delivery only
