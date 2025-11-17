@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "NodeClient.hpp"
-
+#include "Stopwatch.hpp"
 // generated code
 #include "route.grpc.pb.h"
 
@@ -75,9 +75,11 @@ int main(int argc, char** argv){
 
     std::cout << "[Client] Ports: ";
 
+    
     for (const auto& p : ports) {
         std::cout << p << " ";
         std::string target = host + ":" + p;
+        auto start = chrono::high_resolution_clock::now();
         NodeClient client(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
         rsp = client.sendMsg(src, dest, payload);
         if (rsp != "RPC_ERR") {
@@ -85,6 +87,18 @@ int main(int argc, char** argv){
             std::cout << "[Client] Response: " << rsp << std::endl;
             return 0; // done on first successful port
         }
+        auto stop = chrono::high_resolution_clock::now();
+        string timerMsg = "Execution time:";
+        auto executionDuration = chrono::duration_cast<chrono::milliseconds>(stop-start).count();
+        cout<<"------------------" << endl;
+        if(executionDuration < 2){
+            auto executionDurationNS = chrono::duration_cast<chrono::nanoseconds>(stop-start).count();
+            cout<< timerMsg<< ": " << executionDurationNS << "ns" << endl;
+        }else{
+            cout<< timerMsg<< ": " << executionDuration << "ms" << endl;
+        }
+        cout<<"------------------" << endl;
+
     }
 
     // If here, no port worked.
