@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iomanip>
 
+
 // simple FNV-1a 32-bit checksum so we avoid extra libs
 static uint32_t fnv1a32(const std::string& s) {
     const uint32_t FNV_OFFSET = 2166136261u;
@@ -187,6 +188,7 @@ void jobLoop::workerLoop(int workerId)
         string rspid;
 
         const string helloPrefix = "__HELLO__";
+        const string getPopPref = "getAvgPop";
         if (pyld.rfind(helloPrefix, 0) == 0) {
             // Handshake message: "__HELLO__<ip:port>"
             string peerAddr = pyld.substr(helloPrefix.size());
@@ -201,7 +203,38 @@ void jobLoop::workerLoop(int workerId)
             oss << "HELLO-ACK-from-" << nodeInfo.id
                 << " (worker " << workerId << ")";
             rspid = oss.str();
-        } else if (dest == nodeInfo.id) {
+        }else if (pyld.rfind(getPopPref,0) == 0 && dest == nodeInfo.id) {
+             // Only do this for local delivery
+            job->needsForward = false;
+    
+            try {
+                cout << "[Worker " << workerId << "] Attempting to read..." << endl;
+
+                WorldDataParser parser;
+                string filePath = "../dataset/world/populations.csv";
+                auto csvData = parser.read(filePath);
+                cout << "[Worker " << workerId << "]Read in "<< csvData.size() << " rows" << endl;
+
+                
+                vector<int> columnIdx = {0, 5, 68};// cols: country name, 1960, 1968
+                int rowStart = 5; // skip header rows
+
+                parser.calculateAvgPop1930_1968(csvData, columnIdx, rowStart);
+
+                // convert to a single string
+                ostringstream oss;
+                for (const auto& e : parser.getCountryToAvgPop()) {
+                    oss << e.first << ":" << fixed << setprecision(2) << e.second << "\n";
+                }
+                string rsp = oss.str();
+                if (!rsp.empty()) rsp.pop_back(); // remove last comma
+
+                job->resultRspid = rsp;
+                rspid = rsp;
+            } catch (const exception& e) {
+                job->resultRspid = string("Error reading CSV: ") + e.what();
+            }
+        }else if (dest == nodeInfo.id) {
             // Local delivery only
             job->needsForward = false;
 
@@ -232,7 +265,6 @@ void jobLoop::workerLoop(int workerId)
                 rspid = oss.str();
             }
         }
-
         {
             std::lock_guard<std::mutex> lk(job->mtx);
             job->resultRspid = rspid;
