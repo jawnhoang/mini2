@@ -28,7 +28,7 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     //  2) Waits for a worker thread to process it.
     //  3) Returns the result set by the worker (no forwarding logic here).
     std::call_once(workerInitFlag, [this]() {
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 2; i++) { // make worker count == num of nodes online
             workers.emplace_back([this, i]() { this->workerLoop(i); });
         }
     });
