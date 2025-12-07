@@ -37,6 +37,7 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     job->src = msg->src();
     job->dest = msg->dest();
     job->payload = msg->payload();
+    job->originalMsg = msg;
 
     {
         std::lock_guard<std::mutex> lock(queueMutex);
@@ -111,10 +112,11 @@ void jobLoop::runHandshake(){
 grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response){
     const std::string& dest    = msg->dest();
     const std::string& origSrc = msg->src();
+    const std::string& prevSrc = msg->prev();
 
     // 1. Prefer a direct edge to the destination if it exists
     auto directIt = jobStub_.find(dest);
-    if (directIt != jobStub_.end()) {
+    if (directIt != jobStub_.end() && dest != prevSrc && std::find(msg->visited().begin(), msg->visited().end(), dest) == msg->visited().end()) {
         cout << "[Node " << nodeInfo.id
              << "] Forwarding Msg directly to dest Peer " << dest << endl;
 
@@ -137,6 +139,9 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
 
     // 2. Otherwise, or if direct failed, try other peers as next hops
     for (const auto& [pid, stub] : jobStub_) {
+        if(pid == prevSrc){
+            continue;
+        }
         // avoid immediately bouncing back to where it came from
         if (pid == origSrc) {
             continue;
@@ -146,9 +151,15 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
             continue;
         }
 
+        if (std::find(msg->visited().begin(), msg->visited().end(), pid) != msg->visited().end()){
+            continue;
+        }
+
         cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
 
         grpc::ClientContext context;
+        auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(1000); // 100ms timeout
+        context.set_deadline(deadline);
         loop::MsgResponse peerResp;
         grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
 
@@ -157,6 +168,10 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
                  << ": " << peerResp.rspid() << endl;
             response->set_rspid(peerResp.rspid());
             return Status::OK;
+        }else if (!status.ok()){
+            cerr << "[Node " << nodeInfo.id << "] Forward to " << pid
+            << " failed or timed out: " << status.error_message() << endl;
+            continue; // try next peer
         } else {
             cerr << "[Node " << nodeInfo.id << "] Unable to forward msg to Peer Node "
                  << pid << " : " << status.error_message() << endl;
@@ -260,10 +275,18 @@ void jobLoop::workerLoop(int workerId)
             // Worker role: this node is not the final destination, so the worker
             // is responsible for forwarding the message along the overlay using
             // forwardToPeer(). The leader never calls forwardToPeer directly.
+            cout << "Current Node: " << nodeInfo.id << endl;
             loop::Msg forwardMsg;
             forwardMsg.set_src(src);
+            forwardMsg.set_prev(nodeInfo.id);
             forwardMsg.set_dest(dest);
             forwardMsg.set_payload(pyld);
+
+            for(const auto& v : job->originalMsg->visited()){
+                forwardMsg.add_visited(v);
+            }
+
+            forwardMsg.add_visited(nodeInfo.id);
 
             loop::MsgResponse peerResp;
             grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);

@@ -27,8 +27,10 @@ service executeJob{
 
 message Msg {
     string src = 1;
-    string dest = 2;
-    string payload = 3;
+    string prev = 2;
+    string dest = 3;
+    string payload = 4;
+    repeated string visited = 5;
 }
 
 message MsgResponse{

@@ -46,6 +46,7 @@ class jobLoop final : public executeJob::Service{
             string dest;
             string payload;
             string resultRspid;
+            const loop::Msg* originalMsg = nullptr;
             bool done = false;
             bool needsForward = false;
             std::mutex mtx;
