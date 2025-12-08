@@ -12,7 +12,8 @@
 #include <grpcpp/server_context.h>
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/create_channel.h>
-#include <grpcpp/security/credentials.h> 
+#include <grpcpp/security/credentials.h>
+#include <grpcpp/channel.h> 
 
 #include <queue>
 #include <mutex>
@@ -39,7 +40,17 @@ class jobLoop final : public executeJob::Service{
     private:
         NodeId nodeInfo;
         map<string, unique_ptr<executeJob::Stub>> jobStub_;
+        map<string, shared_ptr<grpc::Channel>> peerChannels_; // For connection state checking
+        map<string, bool> peerHealth_; // Track peer health status (false = dead/unhealthy)
         Stopwatch timer;
+
+        enum class JobState {
+            PENDING,
+            ROUTING,
+            PROCESSING,
+            COMPLETED,
+            FAILED
+        };
 
         struct Job {
             string src;
@@ -49,6 +60,7 @@ class jobLoop final : public executeJob::Service{
             const loop::Msg* originalMsg = nullptr;
             bool done = false;
             bool needsForward = false;
+            JobState state = JobState::PENDING;
             std::mutex mtx;
             std::condition_variable cv;
         };
@@ -78,5 +90,7 @@ class jobLoop final : public executeJob::Service{
         Status forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse* response);
 
     private:
+        bool isPeerReady(const std::string& peerId);
+        void updatePeerHealth(const std::string& peerId, bool healthy);
         void workerLoop(int workerId);
 };

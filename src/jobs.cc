@@ -8,6 +8,7 @@
 #include <sstream>
 #include <filesystem>
 #include <atomic>
+#include <thread>
 
 
 
@@ -47,6 +48,7 @@ grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg*
     job->dest = msg->dest();
     job->payload = msg->payload();
     job->originalMsg = msg;
+    job->state = JobState::PENDING;
 
     {
         std::lock_guard<std::mutex> lock(queueMutex);
@@ -87,10 +89,60 @@ void jobLoop::peerStubs(){
             continue;
         }
 
-        jobStub_[pid] = executeJob::NewStub(
-            grpc::CreateChannel(paddr, grpc::InsecureChannelCredentials()));
-        cout << "[Node] Stub for Peer " << pid << " created at " << paddr << endl;
+        shared_ptr<grpc::Channel> channel = grpc::CreateChannel(paddr, grpc::InsecureChannelCredentials());
+        peerChannels_[pid] = channel;
+        jobStub_[pid] = executeJob::NewStub(channel);
+        
+        // Check connection state like Hook does
+        grpc_connectivity_state state = channel->GetState(true);
+        if (state == GRPC_CHANNEL_READY) {
+            peerHealth_[pid] = true;
+            cout << "[Node] Stub for Peer " << pid << " created at " << paddr << " (channel ready)" << endl;
+        } else {
+            peerHealth_[pid] = false;
+            cout << "[Node] Stub for Peer " << pid << " created at " << paddr << " (channel state: " << state << ")" << endl;
+        }
     }
+}
+
+bool jobLoop::isPeerReady(const std::string& peerId) {
+    auto channelIt = peerChannels_.find(peerId);
+    if (channelIt == peerChannels_.end()) {
+        cout << "[Health] Peer " << peerId << " has no channel" << endl;
+        return false;
+    }
+    
+    grpc_connectivity_state state = channelIt->second->GetState(true);
+    bool ready = (state == GRPC_CHANNEL_READY);
+    
+    // Check if channel is completely dead (SHUTDOWN or TRANSIENT_FAILURE that persists)
+    if (state == GRPC_CHANNEL_SHUTDOWN) {
+        cout << "[Health] Peer " << peerId << " channel is SHUTDOWN (dead)" << endl;
+        updatePeerHealth(peerId, false);
+        return false;
+    }
+    
+    // Only log if state is not ready (to reduce spam)
+    if (!ready) {
+        cout << "[Health] Peer " << peerId << " channel state: " << state << " (not ready)" << endl;
+    }
+    
+    updatePeerHealth(peerId, ready);
+    return ready;
+}
+
+void jobLoop::updatePeerHealth(const std::string& peerId, bool healthy) {
+    // Only log if health status changed
+    if (peerHealth_.count(peerId) && peerHealth_[peerId] != healthy) {
+        cout << "[Health] Peer " << peerId << " health changed: " 
+             << (peerHealth_[peerId] ? "healthy" : "unhealthy") 
+             << " -> " << (healthy ? "healthy" : "unhealthy") << endl;
+    } else if (!peerHealth_.count(peerId)) {
+        // First time setting health
+        cout << "[Health] Peer " << peerId << " initial health: " 
+             << (healthy ? "healthy" : "unhealthy") << endl;
+    }
+    peerHealth_[peerId] = healthy;
 }
 
 void jobLoop::runHandshake(){
@@ -122,32 +174,135 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
     const std::string& dest    = msg->dest();
     const std::string& origSrc = msg->src();
     const std::string& prevSrc = msg->prev();
+    
+    // Check if destination is already confirmed as dead (via peerHealth_)
+    if (peerHealth_.count(dest) && !peerHealth_[dest]) {
+        // Double-check channel state to see if it's really dead
+        auto destChannelIt = peerChannels_.find(dest);
+        if (destChannelIt != peerChannels_.end()) {
+            grpc_connectivity_state destState = destChannelIt->second->GetState(true);
+            if (destState == GRPC_CHANNEL_SHUTDOWN) {
+                cerr << "[Node " << nodeInfo.id << "] Destination " << dest 
+                     << " is confirmed dead (SHUTDOWN), giving up" << endl;
+                response->set_rspid("Destination " + dest + " is unreachable (dead)");
+                return Status::OK;
+            }
+        }
+    }
+    
+    // Check if destination channel is completely dead before trying
+    auto destChannelIt = peerChannels_.find(dest);
+    if (destChannelIt != peerChannels_.end()) {
+        grpc_connectivity_state destState = destChannelIt->second->GetState(true);
+        if (destState == GRPC_CHANNEL_SHUTDOWN) {
+            cout << "[Health] Destination " << dest << " channel is SHUTDOWN, marking as dead" << endl;
+            peerHealth_[dest] = false; // Mark as dead
+            response->set_rspid("Destination " + dest + " is unreachable (channel shutdown)");
+            return Status::OK;
+        }
+    }
+
+    // Helper lambda for retry logic with exponential backoff
+    auto tryForward = [this, msg, response](const std::string& peerId, const std::unique_ptr<executeJob::Stub>& stub) -> grpc::Status {
+        const int maxRetries = 3;
+        grpc::Status lastStatus;
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            // Check connection state before EVERY attempt (Hook pattern)
+            if (attempt > 0) {
+                cout << "[Retry] Attempt " << (attempt + 1) << "/" << maxRetries << " for peer " << peerId << endl;
+            }
+            
+            // Always check health before attempting
+            bool ready = isPeerReady(peerId);
+            if (!ready && attempt > 0) {
+                // Wait a bit for channel to recover on retries
+                int backoffMs = 100 * (1 << attempt); // 100ms, 200ms, 400ms
+                cout << "[Retry] Peer " << peerId << " not ready, waiting " << backoffMs << "ms before retry" << endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+            } else if (!ready && attempt == 0) {
+                // First attempt but peer not ready - still try (might be transient)
+                cout << "[Health] Peer " << peerId << " not ready on first attempt, but trying anyway" << endl;
+            }
+            
+            grpc::ClientContext context;
+            auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(800);
+            context.set_deadline(deadline);
+            loop::MsgResponse peerResp;
+            lastStatus = stub->sendMsg(&context, *msg, &peerResp);
+            
+            if (lastStatus.ok()) {
+                response->set_rspid(peerResp.rspid());
+                updatePeerHealth(peerId, true);
+                if (attempt > 0) {
+                    cout << "[Node " << nodeInfo.id << "] Forward to " << peerId 
+                         << " succeeded on retry " << attempt << endl;
+                }
+                return Status::OK;
+            } else {
+                cout << "[Retry] Forward to " << peerId << " failed (attempt " << (attempt + 1) 
+                     << "/" << maxRetries << "): " << lastStatus.error_message() << endl;
+                updatePeerHealth(peerId, false);
+                
+                // Check if this is the destination and it's completely dead
+                if (peerId == msg->dest()) {
+                    auto channelIt = peerChannels_.find(peerId);
+                    if (channelIt != peerChannels_.end()) {
+                        grpc_connectivity_state state = channelIt->second->GetState(true);
+                        if (state == GRPC_CHANNEL_SHUTDOWN) {
+                            cout << "[Health] Destination " << peerId << " confirmed dead (SHUTDOWN)" << endl;
+                            peerHealth_[peerId] = false; // Mark as dead
+                        }
+                    }
+                }
+                
+                if (attempt < maxRetries - 1) {
+                    int backoffMs = 100 * (1 << attempt);
+                    cout << "[Retry] Backing off " << backoffMs << "ms before next attempt" << endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+                }
+            }
+        }
+        return lastStatus;
+    };
 
     // 1. Prefer a direct edge to the destination if it exists
     auto directIt = jobStub_.find(dest);
     if (directIt != jobStub_.end() && dest != prevSrc && std::find(msg->visited().begin(), msg->visited().end(), dest) == msg->visited().end()) {
+        // Always check health before attempting direct forward
+        bool directReady = isPeerReady(dest);
+        if (!directReady && peerHealth_.count(dest) && !peerHealth_[dest]) {
+            cout << "[Node " << nodeInfo.id << "] Direct peer " << dest << " marked unhealthy, but will still try" << endl;
+        }
+        
         cout << "[Node " << nodeInfo.id
              << "] Forwarding Msg directly to dest Peer " << dest << endl;
-
-        grpc::ClientContext context;
-        loop::MsgResponse peerResp;
-        grpc::Status status = directIt->second->sendMsg(&context, *msg, &peerResp);
-
+        
+        grpc::Status status = tryForward(dest, directIt->second);
         if (status.ok()) {
             cout << "[Node " << nodeInfo.id << "] reply from direct Peer " << dest
-                 << ": " << peerResp.rspid() << endl;
-            response->set_rspid(peerResp.rspid());
+                 << ": " << response->rspid() << endl;
             return Status::OK;
         } else {
             cerr << "[Node " << nodeInfo.id
                  << "] Unable to forward msg directly to Peer "
                  << dest << " : " << status.error_message() << endl;
-            // fall through to try other peers as backup
         }
     }
 
     // 2. Otherwise, or if direct failed, try other peers as next hops
+    // Limit attempts to prevent infinite loops
+    int pathAttempts = 0;
+    const int maxPathAttempts = jobStub_.size() * 2; // Try each peer at most twice
+    
     for (const auto& [pid, stub] : jobStub_) {
+        // Prevent infinite loops - limit total path attempts
+        if (pathAttempts >= maxPathAttempts) {
+            cerr << "[Node " << nodeInfo.id << "] Max path attempts (" << maxPathAttempts 
+                 << ") reached, giving up on dest " << dest << endl;
+            break;
+        }
+        
         if(pid == prevSrc){
             continue;
         }
@@ -163,34 +318,54 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
         if (std::find(msg->visited().begin(), msg->visited().end(), pid) != msg->visited().end()){
             continue;
         }
+        
+        // Skip if destination is confirmed dead (check peerHealth_)
+        if (peerHealth_.count(dest) && !peerHealth_[dest]) {
+            auto destChannelIt = peerChannels_.find(dest);
+            if (destChannelIt != peerChannels_.end()) {
+                grpc_connectivity_state destState = destChannelIt->second->GetState(true);
+                if (destState == GRPC_CHANNEL_SHUTDOWN) {
+                    cerr << "[Node " << nodeInfo.id << "] Destination " << dest 
+                         << " is confirmed dead, stopping path search" << endl;
+                    break;
+                }
+            }
+        }
+
+        // Check peer health before attempting, but don't skip - still try even if marked unhealthy
+        // (peer might have recovered)
+        bool peerReady = isPeerReady(pid);
+        if (!peerReady && peerHealth_.count(pid) && !peerHealth_[pid]) {
+            cout << "[Health] Peer " << pid << " marked unhealthy, but will still attempt (might have recovered)" << endl;
+        }
 
         cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
+        pathAttempts++;
 
-        grpc::ClientContext context;
-        auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(800); // 100ms 
-        context.set_deadline(deadline);
-        loop::MsgResponse peerResp;
-        grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
-
+        grpc::Status status = tryForward(pid, stub);
         if (status.ok()) {
             cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid
-                 << ": " << peerResp.rspid() << endl;
-            response->set_rspid(peerResp.rspid());
+                 << ": " << response->rspid() << endl;
             return Status::OK;
-        }else if (!status.ok()){
-            cerr << "[Node " << nodeInfo.id << "] Forward to " << pid
-            << " failed or timed out: " << status.error_message() << endl;
-            continue; // try next peer
         } else {
-            cerr << "[Node " << nodeInfo.id << "] Unable to forward msg to Peer Node "
-                 << pid << " : " << status.error_message() << endl;
+            cerr << "[Node " << nodeInfo.id << "] Forward to " << pid
+                 << " failed after retries: " << status.error_message() << endl;
+            continue; // try next peer
         }
     }
 
     // If we got here, no peer could be used to reach dest
-    cerr << "[Node " << nodeInfo.id << "] No Peer available to reach dest "
-         << dest << endl;
-    response->set_rspid("Path to " + dest + " not found.");
+    // Mark destination as dead if we've exhausted all paths
+    if (pathAttempts >= maxPathAttempts) {
+        peerHealth_[dest] = false; // Mark as dead
+        cerr << "[Node " << nodeInfo.id << "] Marking destination " << dest 
+             << " as unreachable after exhausting all paths (" << pathAttempts << " attempts)" << endl;
+        response->set_rspid("Destination " + dest + " is unreachable (all paths exhausted)");
+    } else {
+        cerr << "[Node " << nodeInfo.id << "] No Peer available to reach dest "
+             << dest << endl;
+        response->set_rspid("Path to " + dest + " not found.");
+    }
     return Status::OK;
 }
 
@@ -222,6 +397,12 @@ void jobLoop::workerLoop(int workerId)
         string src = job->src;
         string dest = job->dest;
         string pyld = job->payload;
+        
+        // Update job state to PROCESSING
+        {
+            std::lock_guard<std::mutex> lk(job->mtx);
+            job->state = JobState::PROCESSING;
+        }
         // if (dest == nodeInfo.id){
         //     cout << "[Node " << nodeInfo.id << "][Worker " << workerId
         //         << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
@@ -299,11 +480,23 @@ void jobLoop::workerLoop(int workerId)
                 rspid = rsp;
             } catch (const exception& e) {
                 job->resultRspid = string("Error reading CSV: ") + e.what();
+                {
+                    std::lock_guard<std::mutex> lk(job->mtx);
+                    job->state = JobState::FAILED;
+                }
             }
         }else if(pyld.rfind(streamPopRef, 0) == 0 && src == nodeInfo.id){
+            // Update state to ROUTING for streamPop
+            {
+                std::lock_guard<std::mutex> lk(job->mtx);
+                job->state = JobState::ROUTING;
+            }
+            
             WorldDataParser parser;
             auto csvData = parser.read("../dataset/world/populations.csv");
             cout << "CSV read in. Preparing to send to Node "<< dest << " " << csvData.size()-5 << " messages." << endl;
+            
+            int failedRows = 0;
             for (size_t i = 5; i < csvData.size(); ++i) {
                 string row = parser.rowToString(csvData[i]);
 
@@ -319,23 +512,51 @@ void jobLoop::workerLoop(int workerId)
 
                 forwardMsg.add_visited(nodeInfo.id);
 
+                // Check if destination is dead before trying (avoid infinite retries)
+                if (peerHealth_.count(dest) && !peerHealth_[dest]) {
+                    auto destChannelIt = peerChannels_.find(dest);
+                    if (destChannelIt != peerChannels_.end()) {
+                        grpc_connectivity_state destState = destChannelIt->second->GetState(true);
+                        if (destState == GRPC_CHANNEL_SHUTDOWN) {
+                            cerr << "[streamPop] Destination " << dest << " is dead, skipping remaining rows" << endl;
+                            failedRows = csvData.size() - 5 - (i - 5); // Count remaining rows
+                            break; // Stop streaming, destination is dead
+                        }
+                    }
+                }
+                
+                // Single attempt per row (forwardToPeer() already has 3 retries inside)
                 loop::MsgResponse peerResp;
                 grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                if (status.ok()) {
-                    ostringstream oss;
-                    oss << peerResp.rspid() << " (via " << nodeInfo.id
-                        << ", worker " << workerId << ")";
-                    rspid = oss.str();
-                } else {
-                    ostringstream oss;
-                    oss << "Forwarding failed at node " << nodeInfo.id
-                        << " (worker " << workerId << ")";
-                    rspid = oss.str();
+                
+                if (!status.ok()) {
+                    failedRows++;
+                    cerr << "[streamPop] Row " << (i-4) << " failed: " << status.error_message() << endl;
+                    
+                    // If destination is now confirmed dead, stop streaming
+                    if (peerHealth_.count(dest) && !peerHealth_[dest]) {
+                        auto destChannelIt = peerChannels_.find(dest);
+                        if (destChannelIt != peerChannels_.end()) {
+                            grpc_connectivity_state destState = destChannelIt->second->GetState(true);
+                            if (destState == GRPC_CHANNEL_SHUTDOWN) {
+                                cerr << "[streamPop] Destination " << dest << " confirmed dead, stopping stream" << endl;
+                                failedRows = csvData.size() - 5 - (i - 5); // Count remaining rows
+                                break;
+                            }
+                        }
+                    }
                 }
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             }
 
-            job->resultRspid = "streamPop complete";        
+            ostringstream oss;
+            oss << "streamPop complete";
+            if (failedRows > 0) {
+                oss << " (" << failedRows << " rows failed)";
+            }
+            job->resultRspid = oss.str();
+            rspid = job->resultRspid;        
         }else if (dest == nodeInfo.id) {
             cout << "[Node " << nodeInfo.id << "][Worker " << workerId
                 << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
@@ -356,6 +577,12 @@ void jobLoop::workerLoop(int workerId)
             // Worker role: this node is not the final destination, so the worker
             // is responsible for forwarding the message along the overlay using
             // forwardToPeer(). The leader never calls forwardToPeer directly.
+            // Update state to ROUTING
+            {
+                std::lock_guard<std::mutex> lk(job->mtx);
+                job->state = JobState::ROUTING;
+            }
+            
             cout << "Current Node: " << nodeInfo.id << endl;
             loop::Msg forwardMsg;
             forwardMsg.set_src(src);
@@ -381,10 +608,18 @@ void jobLoop::workerLoop(int workerId)
                 oss << "Forwarding failed at node " << nodeInfo.id
                     << " (worker " << workerId << ")";
                 rspid = oss.str();
+                // Update state to FAILED on permanent forwarding failure
+                {
+                    std::lock_guard<std::mutex> lk(job->mtx);
+                    job->state = JobState::FAILED;
+                }
             }
         }
         {
             std::lock_guard<std::mutex> lk(job->mtx);
+            if (job->state != JobState::FAILED) {
+                job->state = JobState::COMPLETED;
+            }
             job->resultRspid = rspid;
             job->done = true;
         }
