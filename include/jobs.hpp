@@ -60,6 +60,7 @@ class jobLoop final : public executeJob::Service{
             const loop::Msg* originalMsg = nullptr;
             bool done = false;
             bool needsForward = false;
+            bool isForwarding = false;  // Track if currently forwarding to prevent duplicate forwards
             JobState state = JobState::PENDING;
             std::mutex mtx;
             std::condition_variable cv;

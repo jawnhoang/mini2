@@ -122,9 +122,16 @@ bool jobLoop::isPeerReady(const std::string& peerId) {
         return false;
     }
     
-    // Only log if state is not ready (to reduce spam)
-    if (!ready) {
+    // Don't log health status constantly - only log when it changes
+    // This reduces the "healthy/unhealthy" spam in logs
+    static std::map<std::string, bool> lastLoggedHealth;
+    bool shouldLog = !lastLoggedHealth.count(peerId) || lastLoggedHealth[peerId] != ready;
+    if (!ready && shouldLog) {
         cout << "[Health] Peer " << peerId << " channel state: " << state << " (not ready)" << endl;
+        lastLoggedHealth[peerId] = ready;
+    } else if (ready && shouldLog && lastLoggedHealth.count(peerId) && !lastLoggedHealth[peerId]) {
+        cout << "[Health] Peer " << peerId << " recovered (channel ready)" << endl;
+        lastLoggedHealth[peerId] = ready;
     }
     
     updatePeerHealth(peerId, ready);
@@ -132,16 +139,16 @@ bool jobLoop::isPeerReady(const std::string& peerId) {
 }
 
 void jobLoop::updatePeerHealth(const std::string& peerId, bool healthy) {
-    // Only log if health status changed
+    // Only log if health status changed (to reduce spam)
     if (peerHealth_.count(peerId) && peerHealth_[peerId] != healthy) {
-        cout << "[Health] Peer " << peerId << " health changed: " 
-             << (peerHealth_[peerId] ? "healthy" : "unhealthy") 
-             << " -> " << (healthy ? "healthy" : "unhealthy") << endl;
-    } else if (!peerHealth_.count(peerId)) {
-        // First time setting health
-        cout << "[Health] Peer " << peerId << " initial health: " 
-             << (healthy ? "healthy" : "unhealthy") << endl;
+        // Only log significant changes (unhealthy -> healthy, or healthy -> unhealthy)
+        if (!healthy) {
+            cout << "[Health] Peer " << peerId << " marked UNHEALTHY" << endl;
+        } else {
+            cout << "[Health] Peer " << peerId << " recovered (HEALTHY)" << endl;
+        }
     }
+    // Don't log initial health status to reduce noise
     peerHealth_[peerId] = healthy;
 }
 
@@ -175,6 +182,15 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
     const std::string& origSrc = msg->src();
     const std::string& prevSrc = msg->prev();
     
+    // CRITICAL FIX: Check if we're the destination - if so, we should have already processed this
+    // This prevents duplicate processing when message reaches destination through multiple paths
+    if (dest == nodeInfo.id) {
+        // We're the destination, but forwardToPeer was called - this shouldn't happen
+        // Return success immediately to prevent loops
+        response->set_rspid("Msg delivered to " + nodeInfo.id);
+        return Status::OK;
+    }
+    
     // Check if destination is already confirmed as dead (via peerHealth_)
     if (peerHealth_.count(dest) && !peerHealth_[dest]) {
         // Double-check channel state to see if it's really dead
@@ -203,8 +219,9 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
     }
 
     // Helper lambda for retry logic with exponential backoff
+    // CRITICAL: Only retry ONCE to prevent duplicate messages
     auto tryForward = [this, msg, response](const std::string& peerId, const std::unique_ptr<executeJob::Stub>& stub) -> grpc::Status {
-        const int maxRetries = 3;
+        const int maxRetries = 1; // Only 1 retry to prevent duplicates
         grpc::Status lastStatus;
         
         for (int attempt = 0; attempt < maxRetries; attempt++) {
@@ -213,17 +230,18 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
                 cout << "[Retry] Attempt " << (attempt + 1) << "/" << maxRetries << " for peer " << peerId << endl;
             }
             
-            // Always check health before attempting
+            // Check health before attempting, but don't spam logs
             bool ready = isPeerReady(peerId);
             if (!ready && attempt > 0) {
                 // Wait a bit for channel to recover on retries
                 int backoffMs = 100 * (1 << attempt); // 100ms, 200ms, 400ms
-                cout << "[Retry] Peer " << peerId << " not ready, waiting " << backoffMs << "ms before retry" << endl;
+                // Only log if peer was previously healthy (to reduce noise)
+                if (peerHealth_.count(peerId) && peerHealth_[peerId]) {
+                    cout << "[Retry] Peer " << peerId << " not ready, waiting " << backoffMs << "ms before retry" << endl;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
-            } else if (!ready && attempt == 0) {
-                // First attempt but peer not ready - still try (might be transient)
-                cout << "[Health] Peer " << peerId << " not ready on first attempt, but trying anyway" << endl;
             }
+            // Don't log health status on first attempt to reduce noise
             
             grpc::ClientContext context;
             auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(800);
@@ -238,6 +256,8 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
                     cout << "[Node " << nodeInfo.id << "] Forward to " << peerId 
                          << " succeeded on retry " << attempt << endl;
                 }
+                // Successfully forwarded - stop immediately to prevent infinite loops
+                // Response will propagate back through the chain
                 return Status::OK;
             } else {
                 cout << "[Retry] Forward to " << peerId << " failed (attempt " << (attempt + 1) 
@@ -291,9 +311,10 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
     }
 
     // 2. Otherwise, or if direct failed, try other peers as next hops
-    // Limit attempts to prevent infinite loops
+    // CRITICAL FIX: Only try ONE peer at a time. If it succeeds, STOP immediately.
+    // This prevents duplicate messages from being sent through multiple paths.
     int pathAttempts = 0;
-    const int maxPathAttempts = jobStub_.size() * 2; // Try each peer at most twice
+    const int maxPathAttempts = 3; // Limit to prevent infinite loops - try at most 3 different peers
     
     for (const auto& [pid, stub] : jobStub_) {
         // Prevent infinite loops - limit total path attempts
@@ -332,24 +353,35 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
             }
         }
 
-        // Check peer health before attempting, but don't skip - still try even if marked unhealthy
-        // (peer might have recovered)
-        bool peerReady = isPeerReady(pid);
-        if (!peerReady && peerHealth_.count(pid) && !peerHealth_[pid]) {
-            cout << "[Health] Peer " << pid << " marked unhealthy, but will still attempt (might have recovered)" << endl;
+        // Skip peers that are confirmed dead/unhealthy to reduce noise
+        if (peerHealth_.count(pid) && !peerHealth_[pid]) {
+            auto channelIt = peerChannels_.find(pid);
+            if (channelIt != peerChannels_.end()) {
+                grpc_connectivity_state state = channelIt->second->GetState(false); // Don't wait for state
+                if (state == GRPC_CHANNEL_SHUTDOWN) {
+                    continue; // Skip dead peers
+                }
+            }
         }
 
-        cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
+        cout << "[Node " << nodeInfo.id << "] Trying Peer Node " << pid << " (attempt " << (pathAttempts + 1) << ")" << endl;
         pathAttempts++;
 
         grpc::Status status = tryForward(pid, stub);
         if (status.ok()) {
-            cout << "[Node " << nodeInfo.id << "] reply from Peer " << pid
-                 << ": " << response->rspid() << endl;
+            cout << "[Node " << nodeInfo.id << "] *** SUCCESS: Forwarded to Peer " << pid
+                 << ", response: " << response->rspid() << " *** STOPPING - no more peers will be tried" << endl;
+            // CRITICAL: Successfully forwarded - MUST stop immediately to prevent duplicates
+            // Do NOT try any other peers - the response will propagate back through the chain
             return Status::OK;
         } else {
             cerr << "[Node " << nodeInfo.id << "] Forward to " << pid
-                 << " failed after retries: " << status.error_message() << endl;
+                 << " failed: " << status.error_message() << ", trying next peer" << endl;
+            // Mark peer as unhealthy if it failed
+            if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED || 
+                status.error_code() == grpc::StatusCode::UNAVAILABLE) {
+                peerHealth_[pid] = false;
+            }
             continue; // try next peer
         }
     }
@@ -577,10 +609,22 @@ void jobLoop::workerLoop(int workerId)
             // Worker role: this node is not the final destination, so the worker
             // is responsible for forwarding the message along the overlay using
             // forwardToPeer(). The leader never calls forwardToPeer directly.
-            // Update state to ROUTING
+            // Update state to ROUTING and mark as forwarding to prevent duplicates
             {
                 std::lock_guard<std::mutex> lk(job->mtx);
+                if (job->isForwarding) {
+                    // Already forwarding this job - skip to prevent duplicates
+                    cout << "[Node " << nodeInfo.id << "][Worker " << workerId 
+                         << "] Job already being forwarded, skipping duplicate" << endl;
+                    rspid = "Duplicate forward attempt prevented";
+                    job->state = JobState::COMPLETED;
+                    job->resultRspid = rspid;
+                    job->done = true;
+                    job->cv.notify_one();
+                    continue; // Skip to next job
+                }
                 job->state = JobState::ROUTING;
+                job->isForwarding = true;  // Mark as forwarding
             }
             
             cout << "Current Node: " << nodeInfo.id << endl;
@@ -603,6 +647,17 @@ void jobLoop::workerLoop(int workerId)
                 oss << peerResp.rspid() << " (via " << nodeInfo.id
                     << ", worker " << workerId << ")";
                 rspid = oss.str();
+                // CRITICAL: Forwarding succeeded - mark job as done IMMEDIATELY
+                // This prevents the same message from being processed again
+                {
+                    std::lock_guard<std::mutex> lk(job->mtx);
+                    job->state = JobState::COMPLETED;
+                    job->resultRspid = rspid;
+                    job->done = true;
+                }
+                job->cv.notify_one();
+                // Exit worker loop for this job - don't continue processing
+                continue; // Go to next job in queue
             } else {
                 ostringstream oss;
                 oss << "Forwarding failed at node " << nodeInfo.id
@@ -615,14 +670,16 @@ void jobLoop::workerLoop(int workerId)
                 }
             }
         }
+        // CRITICAL: Set job as done BEFORE notifying to prevent race conditions
+        // This ensures the job is marked complete and won't be processed again
         {
             std::lock_guard<std::mutex> lk(job->mtx);
             if (job->state != JobState::FAILED) {
                 job->state = JobState::COMPLETED;
             }
             job->resultRspid = rspid;
-            job->done = true;
+            job->done = true;  // Mark as done FIRST
         }
-        job->cv.notify_one();
+        job->cv.notify_one();  // Then notify - this prevents the infinite loop
     }
 }
