@@ -120,3 +120,34 @@ vector<vector<string>> WorldDataParser::read(const string& filePath) {
 const vector<pair<string,float>>& WorldDataParser::getCountryToAvgPop() const{
     return CountryToAvgPop;
 }
+
+string WorldDataParser::rowToString(const vector<string>& row) const {
+    if (row.empty()) return "";
+
+    string out;
+    out.reserve(row.size() * 10); // optimize
+
+    for (size_t i = 0; i < row.size(); ++i) {
+        string cell = row[i];
+
+        // Strip surrounding quotation marks if present
+        if (cell.size() >= 2 && 
+            cell.front() == '"' && 
+            cell.back() == '"') 
+        {
+            cell = cell.substr(1, cell.size() - 2);
+        }
+
+        // Remove CR if exists
+        if (!cell.empty() && cell.back() == '\r')
+            cell.pop_back();
+
+        out += cell;
+
+        // separator for readability
+        if (i < row.size() - 1)
+            out += " | ";
+    }
+
+    return out;
+}

@@ -16,6 +16,7 @@ class WorldDataParser{
 
         void calculateAvgPop1930_1968(vector<vector<string>>& csvData, vector<int>& columnIdx, int& rowStart);
         void printAvgPopSummary();
+        string rowToString(const vector<string>& row)const;
 
         const vector<pair<string,float>>& getCountryToAvgPop() const;
         // // Q3: group ISO3 country codes by income level (header-driven)

@@ -4,6 +4,10 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+
 
 // simple FNV-1a 32-bit checksum so we avoid extra libs
 static uint32_t fnv1a32(const std::string& s) {
@@ -217,6 +221,13 @@ void jobLoop::workerLoop(int workerId)
 
         const string helloPrefix = "__HELLO__";
         const string getPopPref = "getAvgPop";
+        const string streamPopRef = "streamPop";
+        if (pyld.rfind("streamRow:", 0) == 0 && dest == nodeInfo.id) {
+            job->needsForward = false;
+            string row = pyld.substr(strlen("streamRow:"));
+            cout << "[Node " << nodeInfo.id << "] Received row: " << row << endl;
+            job->resultRspid = "row received";
+        }
         if (pyld.rfind(helloPrefix, 0) == 0) {
             // Handshake message: "__HELLO__<ip:port>"
             string peerAddr = pyld.substr(helloPrefix.size());
@@ -263,6 +274,50 @@ void jobLoop::workerLoop(int workerId)
             } catch (const exception& e) {
                 job->resultRspid = string("Error reading CSV: ") + e.what();
             }
+        }else if(pyld.rfind(streamPopRef, 0) == 0 && src == nodeInfo.id){
+            // if (jobStub_.count(dest) == 0) {
+            //     cerr << "[Node " << nodeInfo.id << "] No stub to send streamPop row to " << dest << endl;
+            //     job->resultRspid = "Failed: no stub to target";
+            // }
+            job->needsForward = false;
+
+
+            // Open CSV
+            WorldDataParser parser;
+            auto csvData = parser.read("../dataset/world/populations.csv");
+            cout << "CSV read in. Preparing to send to Dest" << endl;
+            for (size_t i = 5; i < csvData.size(); ++i) {
+                string row = parser.rowToString(csvData[i]);
+
+                loop::Msg forwardMsg;
+                forwardMsg.set_src(src);
+                forwardMsg.set_prev(nodeInfo.id);
+                forwardMsg.set_dest(dest);
+                forwardMsg.set_payload("Row: " + row);
+
+                for(const auto& v : job->originalMsg->visited()){
+                    forwardMsg.add_visited(v);
+                }
+
+                forwardMsg.add_visited(nodeInfo.id);
+
+                loop::MsgResponse peerResp;
+                grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (status.ok()) {
+                    ostringstream oss;
+                    oss << peerResp.rspid() << " (via " << nodeInfo.id
+                        << ", worker " << workerId << ")";
+                    rspid = oss.str();
+                } else {
+                    ostringstream oss;
+                    oss << "Forwarding failed at node " << nodeInfo.id
+                        << " (worker " << workerId << ")";
+                    rspid = oss.str();
+                }
+            }
+
+            job->resultRspid = "streamPop complete";        
         }else if (dest == nodeInfo.id) {
             // Local delivery only
             job->needsForward = false;
