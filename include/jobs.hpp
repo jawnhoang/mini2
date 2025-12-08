@@ -61,6 +61,9 @@ class jobLoop final : public executeJob::Service{
         std::once_flag workerInitFlag;
 
     public:
+        static int streamPopRowsReceived;
+        static std::mutex streamPopRowsReceivedMutex;
+
         explicit jobLoop(const NodeId& nodeData): nodeInfo(nodeData){
             peerStubs();
         }

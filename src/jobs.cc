@@ -7,6 +7,8 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <atomic>
+
 
 
 // simple FNV-1a 32-bit checksum so we avoid extra libs
@@ -23,6 +25,9 @@ static uint32_t fnv1a32(const std::string& s) {
 
 
 using namespace std;
+
+int jobLoop::streamPopRowsReceived = 0;
+std::mutex jobLoop::streamPopRowsReceivedMutex;
 
 grpc::Status jobLoop::sendMsg(::grpc::ServerContext* context, const ::loop::Msg* msg, ::loop::MsgResponse* response)
 {
@@ -162,7 +167,7 @@ grpc::Status jobLoop::forwardToPeer(const ::loop::Msg* msg, ::loop::MsgResponse*
         cout << "[Node " << nodeInfo.id << "] Forwarding Msg to Peer Node " << pid << endl;
 
         grpc::ClientContext context;
-        auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(1000); // 100ms timeout
+        auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(800); // 100ms 
         context.set_deadline(deadline);
         loop::MsgResponse peerResp;
         grpc::Status status = stub->sendMsg(&context, *msg, &peerResp);
@@ -197,6 +202,10 @@ void jobLoop::workerLoop(int workerId)
     //  2) Processes local messages or handshake messages.
     //  3) If the destination is another node, forwards the message using
     //     forwardToPeer() and records the result back into the Job.
+    {
+        std::lock_guard<std::mutex> lock(jobLoop::streamPopRowsReceivedMutex);
+        jobLoop::streamPopRowsReceived = 0;
+    }
     for (;;) {
         std::shared_ptr<Job> job;
 
@@ -213,10 +222,20 @@ void jobLoop::workerLoop(int workerId)
         string src = job->src;
         string dest = job->dest;
         string pyld = job->payload;
+        // if (dest == nodeInfo.id){
+        //     cout << "[Node " << nodeInfo.id << "][Worker " << workerId
+        //         << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+        //     // streamPopRowsReceived.fetch_add(1, std::memory_order_relaxed);
+        //     // cout<< "Total Msgs: " << streamPopRowsReceived.load();
+        //     // streamPopRowsReceived.store(0, std::memory_order_relaxed);
+        //     // {
+        //     //     std::lock_guard<std::mutex> lock(streamPopRowsReceivedMutex);
+        //     //     streamPopRowsReceived++;
+        //     // }
+        //     // cout<< "Total Msgs: " << jobLoop::streamPopRowsReceived << endl;
 
-        cout << "[Node " << nodeInfo.id << "][Worker " << workerId
-             << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
 
+        // }
         string rspid;
 
         const string helloPrefix = "__HELLO__";
@@ -225,8 +244,15 @@ void jobLoop::workerLoop(int workerId)
         if (pyld.rfind("streamRow:", 0) == 0 && dest == nodeInfo.id) {
             job->needsForward = false;
             string row = pyld.substr(strlen("streamRow:"));
-            cout << "[Node " << nodeInfo.id << "] Received row: " << row << endl;
+            // cout << "[Node " << nodeInfo.id << "] Received row: " << row << endl;
+            {
+                std::lock_guard<std::mutex> lock(jobLoop::streamPopRowsReceivedMutex);
+                jobLoop::streamPopRowsReceived++;
+                cout << "[Node " << nodeInfo.id << "] Received row: " << row << endl;
+                cout << "Total Msgs: " << jobLoop::streamPopRowsReceived << endl;
+            }
             job->resultRspid = "row received";
+            continue;
         }
         if (pyld.rfind(helloPrefix, 0) == 0) {
             // Handshake message: "__HELLO__<ip:port>"
@@ -252,7 +278,7 @@ void jobLoop::workerLoop(int workerId)
                 WorldDataParser parser;
                 string filePath = "../dataset/world/populations.csv";
                 auto csvData = parser.read(filePath);
-                cout << "[Worker " << workerId << "]Read in "<< csvData.size() << " rows" << endl;
+                cout << "[Worker " << workerId << "]Read in "<< csvData.size() - 5 << " rows" << endl;
 
                 
                 vector<int> columnIdx = {0, 5, 68};// cols: country name, 1960, 1968
@@ -275,17 +301,9 @@ void jobLoop::workerLoop(int workerId)
                 job->resultRspid = string("Error reading CSV: ") + e.what();
             }
         }else if(pyld.rfind(streamPopRef, 0) == 0 && src == nodeInfo.id){
-            // if (jobStub_.count(dest) == 0) {
-            //     cerr << "[Node " << nodeInfo.id << "] No stub to send streamPop row to " << dest << endl;
-            //     job->resultRspid = "Failed: no stub to target";
-            // }
-            job->needsForward = false;
-
-
-            // Open CSV
             WorldDataParser parser;
             auto csvData = parser.read("../dataset/world/populations.csv");
-            cout << "CSV read in. Preparing to send to Dest" << endl;
+            cout << "CSV read in. Preparing to send to Node "<< dest << " " << csvData.size()-5 << " messages." << endl;
             for (size_t i = 5; i < csvData.size(); ++i) {
                 string row = parser.rowToString(csvData[i]);
 
@@ -303,7 +321,7 @@ void jobLoop::workerLoop(int workerId)
 
                 loop::MsgResponse peerResp;
                 grpc::Status status = forwardToPeer(&forwardMsg, &peerResp);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 if (status.ok()) {
                     ostringstream oss;
                     oss << peerResp.rspid() << " (via " << nodeInfo.id
@@ -319,6 +337,14 @@ void jobLoop::workerLoop(int workerId)
 
             job->resultRspid = "streamPop complete";        
         }else if (dest == nodeInfo.id) {
+            cout << "[Node " << nodeInfo.id << "][Worker " << workerId
+                << "] Msg recelived from [Node " << src << "]: " << pyld << endl;
+            {
+                std::lock_guard<std::mutex> lock(jobLoop::streamPopRowsReceivedMutex);
+                jobLoop::streamPopRowsReceived++;
+                // cout << "[Node " << nodeInfo.id << "] Received row: " << row << endl;
+                cout << "Total Msgs: " << jobLoop::streamPopRowsReceived << endl;
+            }
             // Local delivery only
             job->needsForward = false;
 
